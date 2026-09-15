@@ -21,6 +21,7 @@ import java.util.Map;
 import org.saiku.repository.AclEntry;
 import org.saiku.service.datasource.DatasourceService;
 import org.saiku.service.user.UserService;
+import org.saiku.service.util.security.Usernames;
 import org.saiku.web.service.SessionService;
 import org.saiku.web.share.ShareToken;
 import org.saiku.web.share.ShareTokenStore;
@@ -172,7 +173,7 @@ public class ShareTokenResource {
         }
         String username = currentUsername();
         List<String> roles = currentRoles();
-        boolean canManage = (username != null && username.equals(t.createdBy))
+        boolean canManage = Usernames.sameUser(username, t.createdBy)
                 || isAdmin(roles)
                 || stillCanGrant(t.dashboardPath, username, roles);
         if (!canManage) {
@@ -214,12 +215,11 @@ public class ShareTokenResource {
         return u == null ? null : u.toString();
     }
 
-    @SuppressWarnings("unchecked")
+    // saiku#1752: roles come from the single authoritative SecurityContextHolder reader, not the
+    // lazily-seeded session "roles" map (see SessionRoles / saiku#1747). ROLE_SHARE_GUEST is carried
+    // as a SecurityContextHolder authority on the guest principal, so it resolves here identically.
     private List<String> currentRoles() {
-        if (sessionService == null) return List.of();
-        Object r = sessionService.getAllSessionObjects().get("roles");
-        if (r instanceof List<?>) return (List<String>) r;
-        return List.of();
+        return org.saiku.web.rest.util.SessionRoles.currentRoles();
     }
 
     private static Response badRequest(String field, String message) {

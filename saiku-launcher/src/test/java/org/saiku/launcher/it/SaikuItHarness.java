@@ -39,6 +39,14 @@ public final class SaikuItHarness {
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final Duration HTTP_TIMEOUT = Duration.ofSeconds(60);
 
+    /**
+     * saiku#1732: bcrypt hash for password {@code "admin"} — the shipped default from
+     * {@code WEB-INF/users.properties}. Reused for the seeded non-admin {@code viewer} so the
+     * boundary ITs authenticate a valid ROLE_USER-only credential (same password, no ROLE_ADMIN).
+     */
+    private static final String BCRYPT_ADMIN_PASSWORD =
+            "{bcrypt}$2a$10$4lJwsvvv..UqK31JmBSoCOf7hYgKurOB2sEacVVIrqA97BXc4cFju";
+
     private final Server server;
     private final Path home;
     private final String baseUrl;
@@ -68,6 +76,15 @@ public final class SaikuItHarness {
             return existing;
         }
         Path home = Files.createTempDirectory("saiku-it-");
+        // saiku#1732: seed a non-admin `viewer` (ROLE_USER only) alongside the default
+        // admin so the admin-boundary ITs can prove role denial (viewer -> 403 on
+        // /rest/saiku/admin/**, but 200 on a normal isFullyAuthenticated() endpoint).
+        // The launcher's resolveEffectiveUsersFile prefers an external
+        // <home>/users.properties over the WAR default, so writing it here BEFORE
+        // bootServer makes Spring Security load both rows. Both users share the shipped
+        // bcrypt hash for password "admin" — the viewer just lacks ROLE_ADMIN. Written
+        // before the boot so the property resolution below sees the file.
+        seedUsersFile(home);
         // saiku#1153: the harness authenticates as the default admin/admin seed
         // user, so it must opt in to the default-credentials policy or bootServer
         // refuses to start. The IT JVM is a trusted local fixture, never exposed.
@@ -93,6 +110,24 @@ public final class SaikuItHarness {
         // Shut down at JVM exit (failsafe forks a reusable JVM per test class).
         Runtime.getRuntime().addShutdownHook(new Thread(h::stopQuietly));
         return h;
+    }
+
+    /**
+     * saiku#1732: write {@code <home>/users.properties} with the default {@code admin}
+     * (ROLE_USER, ROLE_ADMIN) plus a non-admin {@code viewer} (ROLE_USER only). The launcher's
+     * {@code resolveEffectiveUsersFile} prefers this external file over the WAR default, so
+     * both rows are loaded by Spring Security. Both authenticate with password {@code "admin"};
+     * the viewer simply lacks ROLE_ADMIN, which is exactly what AdminIT's role-boundary
+     * assertions need. Preserving the admin row keeps every other IT (which authenticates as
+     * admin/admin) working unchanged.
+     */
+    private static void seedUsersFile(Path home) throws Exception {
+        Files.write(
+                home.resolve("users.properties"),
+                java.util.List.of(
+                        "# saiku#1732 IT harness: admin + non-admin viewer, both password \"admin\".",
+                        "admin=" + BCRYPT_ADMIN_PASSWORD + ",ROLE_USER,ROLE_ADMIN",
+                        "viewer=" + BCRYPT_ADMIN_PASSWORD + ",ROLE_USER"));
     }
 
     private void waitForReady() throws Exception {
@@ -125,12 +160,52 @@ public final class SaikuItHarness {
         return home;
     }
 
+    /**
+     * saiku#1738 — Windows-portable repository segment for the admin user's home.
+     *
+     * <p>Saiku's runtime home convention is {@code homes/home:<user>}, but the colon in that
+     * segment is illegal in a Windows filesystem path: the server materialises repository paths
+     * via {@code Paths.get(...)} in {@code FilesystemRepositoryManager.resolveWithinDatadir}, and
+     * on Windows {@code Paths.get("homes/home:admin/...")} throws {@link
+     * java.nio.file.InvalidPathException} (a colon is only legal at index 1, the drive letter). So
+     * {@code RepositoryIT}/{@code AppBuilderIT} — which drive real save/load/delete through that
+     * path — failed on a local Windows dev machine. CI is Linux-only, so it never surfaced there.
+     *
+     * <p>These ITs only need a valid, writable repository location under {@code homes/}; the exact
+     * segment name is not asserted. A colon-free segment resolves identically on every OS (including
+     * the Linux CI runners, so behaviour there is unchanged) while staying Windows-safe.
+     *
+     * @param child the leaf resource name (e.g. an app or {@code .saiku} filename)
+     * @return {@code homes/home-admin/<child>} — no leading slash
+     */
+    public static String adminHomePath(String child) {
+        return "homes/home-admin/" + child;
+    }
+
     /** Issue a GET against {@code path} with admin Basic auth. */
     public HttpResponse<String> getAuth(String path) throws Exception {
         return http.send(
                 HttpRequest.newBuilder(URI.create(baseUrl + path))
                         .timeout(HTTP_TIMEOUT)
                         .header("Authorization", adminBasicAuth)
+                        .header("Accept", "application/json")
+                        .GET()
+                        .build(),
+                HttpResponse.BodyHandlers.ofString());
+    }
+
+    /**
+     * saiku#1732: issue a GET against {@code path} with an arbitrary Basic-auth credential.
+     * Used by AdminIT to exercise the admin boundary as the seeded non-admin {@code viewer}
+     * (password {@code "admin"}, ROLE_USER only). See {@link #seedUsersFile(Path)}.
+     */
+    public HttpResponse<String> getAuth(String user, String password, String path) throws Exception {
+        String cred =
+                "Basic " + Base64.getEncoder().encodeToString((user + ":" + password).getBytes(StandardCharsets.UTF_8));
+        return http.send(
+                HttpRequest.newBuilder(URI.create(baseUrl + path))
+                        .timeout(HTTP_TIMEOUT)
+                        .header("Authorization", cred)
                         .header("Accept", "application/json")
                         .GET()
                         .build(),

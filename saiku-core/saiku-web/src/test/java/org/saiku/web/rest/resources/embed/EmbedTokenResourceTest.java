@@ -1,3 +1,7 @@
+/*
+ *   Copyright 2026 Spicule Ltd
+ *   Apache License, Version 2.0.
+ */
 package org.saiku.web.rest.resources.embed;
 
 import static org.junit.Assert.assertEquals;
@@ -9,6 +13,7 @@ import jakarta.ws.rs.core.Response;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
@@ -52,6 +57,12 @@ public class EmbedTokenResourceTest {
         resource.setDatasourceService(ds);
         resource.setSessionService(session);
         resource.setUserService(users);
+    }
+
+    @After
+    public void tearDown() {
+        // saiku#1752: don't bleed the seeded SecurityContext authorities into the next test.
+        org.saiku.web.rest.resources.RoleTestSupport.clear();
     }
 
     /* ---------------------------- mint ---------------------------- */
@@ -211,6 +222,30 @@ public class EmbedTokenResourceTest {
         assertTrue(tokenStore.load(token).revoked);
     }
 
+    /**
+     * saiku#1907 F4 (CWE-178): a token minted under one case spelling of an account must remain
+     * revocable by the SAME account presenting under a different case — the account store matches
+     * usernames case-insensitively. {@code ds.allow} is scoped only to the minting spelling, so
+     * {@code stillCanGrant} is false at revoke time and only the creator-equality check can permit
+     * this. RED pre-fix (case-sensitive equals denies the creator; 403).
+     */
+    @Test
+    public void revoke_by_creator_succeeds_when_caller_case_differs() {
+        session.username = "Admin";
+        ds.allow("/q.saiku");
+        EmbedTokenResource.MintRequest req = new EmbedTokenResource.MintRequest();
+        req.resourceKind = "query";
+        req.resourcePath = "/q.saiku";
+        Response mint = resource.mint(req);
+        @SuppressWarnings("unchecked")
+        String token = (String) ((Map<String, Object>) mint.getEntity()).get("token");
+
+        session.username = "admin"; // same account, canonical spelling
+        Response r = resource.revokeToken(token);
+        assertEquals(200, r.getStatus());
+        assertTrue(tokenStore.load(token).revoked);
+    }
+
     @Test
     public void revoke_by_admin_role_succeeds() {
         // Bob mints a token, admin role can revoke even though admin didn't mint.
@@ -358,6 +393,26 @@ public class EmbedTokenResourceTest {
         req.resourcePath = "/exec.saikudash";
         resource.grantPublic(req);
 
+        Response r = resource.revokePublic("dashboard", "/exec.saikudash");
+        assertEquals(200, r.getStatus());
+        assertFalse(publicRegistry.isPublic("dashboard", "/exec.saikudash"));
+    }
+
+    /**
+     * saiku#1907 F4 (CWE-178): a public grant minted under one case spelling of an account must
+     * remain revocable by the SAME account presenting under a different case. RED pre-fix
+     * (case-sensitive equals denies the grantor; 403, grant left in place).
+     */
+    @Test
+    public void revoke_public_by_creator_succeeds_when_caller_case_differs() {
+        session.username = "Admin";
+        ds.allow("/exec.saikudash");
+        EmbedTokenResource.GrantRequest req = new EmbedTokenResource.GrantRequest();
+        req.resourceKind = "dashboard";
+        req.resourcePath = "/exec.saikudash";
+        resource.grantPublic(req);
+
+        session.username = "admin"; // same account, canonical spelling
         Response r = resource.revokePublic("dashboard", "/exec.saikudash");
         assertEquals(200, r.getStatus());
         assertFalse(publicRegistry.isPublic("dashboard", "/exec.saikudash"));
@@ -522,6 +577,10 @@ public class EmbedTokenResourceTest {
 
         @Override
         public Map<String, Object> getAllSessionObjects() {
+            // saiku#1752: the resource now reads roles authoritatively from SecurityContextHolder,
+            // not this map. Seed the holder from the fields the tests set so the existing
+            // "session.roles = ..." assignments keep driving the role-scoped assertions.
+            org.saiku.web.rest.resources.RoleTestSupport.authenticate(username, roles);
             Map<String, Object> m = new HashMap<>();
             m.put("username", username);
             m.put("roles", roles);

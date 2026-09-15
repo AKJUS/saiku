@@ -1,3 +1,7 @@
+/*
+ *   Copyright 2026 Spicule Ltd
+ *   Apache License, Version 2.0.
+ */
 package org.saiku.olap.query2;
 
 import java.util.ArrayList;
@@ -136,7 +140,6 @@ public class ThinQueryModel {
                 }
             }
         }
-        // TODO Auto-generated method stub
         return false;
     }
 

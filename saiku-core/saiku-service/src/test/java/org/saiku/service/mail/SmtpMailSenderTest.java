@@ -1,3 +1,7 @@
+/*
+ *   Copyright 2026 Spicule Ltd
+ *   Apache License, Version 2.0.
+ */
 package org.saiku.service.mail;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -22,7 +26,7 @@ class SmtpMailSenderTest {
                 "127.0.0.1", greenMail.getSmtp().getPort(), null, null, "saiku@example.com", false, false, null);
         SmtpMailSender sender = new SmtpMailSender(cfg);
 
-        MailMessage m = new MailMessage(
+        MailMessage m = MailMessage.of(
                 "me@example.com",
                 "saiku@example.com",
                 "Your analysis",
@@ -69,5 +73,71 @@ class SmtpMailSenderTest {
             }
         }
         assertTrue(inlineChartFound, "expected an inline image/png with Content-ID <chart> inside the related part");
+    }
+
+    @Test
+    void nullListUnsubscribe_emitsNoUnsubscribeHeaders() throws Exception {
+        // saiku#1811 PR2: the existing self-send/test paths pass a null List-Unsubscribe. Assert the
+        // sender emits NEITHER unsubscribe header — the message is unchanged from before PR2.
+        MailConfig cfg = new MailConfig(
+                "127.0.0.1", greenMail.getSmtp().getPort(), null, null, "saiku@example.com", false, false, null);
+        SmtpMailSender sender = new SmtpMailSender(cfg);
+
+        MailMessage m =
+                MailMessage.of("me@example.com", "saiku@example.com", "No unsub", "<p>hi</p>", List.of(), List.of());
+        sender.send(m);
+
+        assertTrue(greenMail.waitForIncomingEmail(5000, 1));
+        MimeMessage received = greenMail.getReceivedMessages()[0];
+        assertNull(received.getHeader("List-Unsubscribe"), "no List-Unsubscribe header when value is null");
+        assertNull(received.getHeader("List-Unsubscribe-Post"), "no List-Unsubscribe-Post header when value is null");
+    }
+
+    @Test
+    void setListUnsubscribe_emitsBothRfc8058Headers() throws Exception {
+        MailConfig cfg = new MailConfig(
+                "127.0.0.1", greenMail.getSmtp().getPort(), null, null, "saiku@example.com", false, false, null);
+        SmtpMailSender sender = new SmtpMailSender(cfg);
+
+        String unsub = "<https://host/rest/saiku/mail/unsubscribe?address=me%40example.com&token=abc>";
+        MailMessage m = new MailMessage(
+                "me@example.com", "saiku@example.com", "With unsub", "<p>hi</p>", List.of(), List.of(), unsub);
+        sender.send(m);
+
+        assertTrue(greenMail.waitForIncomingEmail(5000, 1));
+        MimeMessage received = greenMail.getReceivedMessages()[0];
+        String[] lu = received.getHeader("List-Unsubscribe");
+        assertNotNull(lu);
+        assertEquals(unsub, lu[0]);
+        String[] lup = received.getHeader("List-Unsubscribe-Post");
+        assertNotNull(lup);
+        assertEquals("List-Unsubscribe=One-Click", lup[0]);
+    }
+
+    @Test
+    void listUnsubscribe_crlfIsStripped_noHeaderInjection() throws Exception {
+        // saiku#1811 PR4 (SEC carry-forward #1): a CR/LF smuggled into the List-Unsubscribe value must be
+        // stripped before setHeader so it can't inject an additional SMTP header.
+        MailConfig cfg = new MailConfig(
+                "127.0.0.1", greenMail.getSmtp().getPort(), null, null, "saiku@example.com", false, false, null);
+        SmtpMailSender sender = new SmtpMailSender(cfg);
+
+        String malicious = "<https://host/u?a=x>\r\nBcc: victim@evil.com";
+        MailMessage m = new MailMessage(
+                "me@example.com", "saiku@example.com", "CRLF", "<p>hi</p>", List.of(), List.of(), malicious);
+        sender.send(m);
+
+        assertTrue(greenMail.waitForIncomingEmail(5000, 1));
+        MimeMessage received = greenMail.getReceivedMessages()[0];
+        String[] lu = received.getHeader("List-Unsubscribe");
+        assertNotNull(lu);
+        // No raw CR/LF survives in the header value.
+        assertFalse(lu[0].contains("\r"), "CR must be stripped");
+        assertFalse(lu[0].contains("\n"), "LF must be stripped");
+        // The smuggled Bcc header must NOT exist as a real header, and no extra recipient was injected.
+        assertNull(received.getHeader("Bcc"), "smuggled Bcc must not become a real header");
+        for (jakarta.mail.Address a : received.getAllRecipients()) {
+            assertFalse(a.toString().contains("victim@evil.com"), "no injected recipient may appear");
+        }
     }
 }

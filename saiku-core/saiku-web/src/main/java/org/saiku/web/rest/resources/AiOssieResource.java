@@ -1345,8 +1345,11 @@ public class AiOssieResource {
      * shelves the filter is a no-op — semantically we can't decide what "backing count" means
      * for e.g. AVG(price), so we leave those responses unchanged rather than silently
      * suppress everything.
+     *
+     * <p>Package-visible (saiku#1482) so the call-site behaviour — masking + the
+     * {@code meta.suppressed} block — is unit-testable without a live Ossie datasource.
      */
-    private void applyKAnonymity(OssieAiQueryResponse resp) {
+    void applyKAnonymity(OssieAiQueryResponse resp) {
         if (kAnonymityFilter == null || !kAnonymityFilter.enabled()) return;
         List<String> countKeys = new ArrayList<>();
         for (OssieAiQueryResponse.Column c : resp.getColumns()) {
@@ -1440,9 +1443,13 @@ public class AiOssieResource {
      * <p>Column index alignment: the header row emits row-shelf then column-shelf then
      * metrics — same order the records-format path uses to build column descriptors —
      * so we can identify metric column positions purely from the request shape.
+     *
+     * <p>Package-visible (saiku#1402) so the call-site behaviour — cell masking + the
+     * top-level {@code suppressed} block — is unit-testable without a live Ossie
+     * datasource, matching the records-path seam (saiku#1482).
      */
     @SuppressWarnings("unchecked")
-    private void applyKAnonymityMatrix(Map<String, Object> body, OssieAiSchema schema, OssieAiQueryRequest req) {
+    void applyKAnonymityMatrix(Map<String, Object> body, OssieAiSchema schema, OssieAiQueryRequest req) {
         if (kAnonymityFilter == null || !kAnonymityFilter.enabled()) return;
         if (schema == null || req == null) return;
         int nRows = req.getRows().size();

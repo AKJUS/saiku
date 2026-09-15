@@ -1,7 +1,13 @@
+/*
+ *   Copyright 2026 Spicule Ltd
+ *   Apache License, Version 2.0.
+ */
 package org.saiku.repository;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 import java.io.File;
@@ -143,6 +149,36 @@ public class FilesystemRepositoryManagerPathTraversalTest {
     }
 
     @Test
+    public void saveBinaryInternalFile_rejects_dotdot_traversal_write() throws Exception {
+        // Mirror of saveBinaryInternalFile_writes_inside_datadir_not_jvm_cwd above, but the
+        // repo-relative path climbs out of <datadir>/unknown/ via ../../ instead of staying
+        // inside it. createNode() must resolve strictly inside the datadir (the same guard
+        // getNode()/resolveWithinDatadir already apply on the read side) instead of naively
+        // concatenating the datadir with the caller-supplied path.
+        byte[] payload = "evil".getBytes(StandardCharsets.UTF_8);
+        String traversalPath = "../../outside/evil.sds";
+
+        try {
+            manager.saveBinaryInternalFile(
+                    new java.io.ByteArrayInputStream(payload), traversalPath, "application/octet-stream");
+        } catch (RuntimeException expected) {
+            // Acceptable: the createNode guard fails closed (throws SaikuServiceException, a
+            // RuntimeException) rather than silently writing outside the datadir.
+        }
+
+        // Whichever way the call above resolved, the escaped file must never land on disk.
+        // The traversal targets the same "outside" folder planted in setUp() for outsideSecret.
+        File escaped = new File(outsideSecret.getParentFile(), "evil.sds");
+        if (escaped.exists()) {
+            try {
+                Files.delete(escaped.toPath());
+            } catch (Exception ignored) {
+            }
+            fail("saveBinaryInternalFile must not write outside the repo root; found: " + escaped.getAbsolutePath());
+        }
+    }
+
+    @Test
     public void getInternalFile_absolute_path_outside_datadir_is_rejected() throws Exception {
         // An absolute path that doesn't start with the datadir must not be readable either.
         String absoluteOutside = outsideSecret.getAbsolutePath();
@@ -157,6 +193,215 @@ public class FilesystemRepositoryManagerPathTraversalTest {
         assertNull(
                 "absolute path outside the datadir must not be readable, got: " + contents,
                 contents == null ? null : (contents.contains("TOP_SECRET") ? contents : null));
+    }
+
+    @Test
+    public void saveDataSource_rejects_dotdot_traversal_write() throws Exception {
+        // The actual #1906 sink, end to end. RepositoryDatasourceManager.addDatasource builds
+        // this exact path shape -- separator + "datasources" + separator + <name> + ".sds" --
+        // and hands it straight to saveDataSource. This manager has no knowledge of that
+        // caller's own name allowlist, so createNode() has to be the backstop here: it must
+        // resolve strictly inside the datadir instead of naively concatenating the datadir with
+        // the caller-supplied path.
+        DataSource ds = new DataSource();
+        ds.setName("evil");
+        String traversalPath = "/datasources/../../outside/evil.sds";
+
+        try {
+            manager.saveDataSource(ds, traversalPath, "fixme");
+        } catch (RuntimeException expected) {
+            // Acceptable: the createNode guard fails closed (throws SaikuServiceException, a
+            // RuntimeException) rather than silently writing outside the datadir.
+        }
+
+        // Per resolveWithinDatadir's own arithmetic: base is <datadir>/unknown/, and
+        // "/datasources/../../outside/evil.sds" resolved against it cancels "datasources" then
+        // "unknown", landing back at <datadir> itself before descending into a brand new
+        // "outside" folder -- i.e. <datadir>/outside/evil.sds, a sibling of the "unknown"
+        // workspace directory the repo is actually scoped to. Pre-fix, createNode() built this
+        // same string via `new File(getDatadir(), filename)` with no bounds check, and
+        // FileWriter would have created exactly this file; that sibling must never be created.
+        File escaped = new File(datadir, "outside/evil.sds");
+        if (escaped.exists()) {
+            try {
+                Files.delete(escaped.toPath());
+            } catch (Exception ignored) {
+            }
+            fail("saveDataSource must not write outside the repo root; found: " + escaped.getAbsolutePath());
+        }
+    }
+
+    @Test
+    public void createUser_rejects_dotdot_traversal_in_username() throws Exception {
+        // createFolder() is private; createUser() is the nearest public caller that reaches it
+        // directly with no ACL/session wiring needed -- every login / admin add-user path calls
+        // it with "/homes/" + username, so a username of "../../evil" is exactly the
+        // caller-controlled input createFolder() must guard against.
+        try {
+            manager.createUser("../../evil");
+        } catch (RuntimeException expected) {
+            // Acceptable: createFolder's guard fails closed (throws SaikuServiceException).
+        }
+
+        // Per resolveWithinDatadir's arithmetic: base is <datadir>/unknown/, and
+        // "/homes/../../evil" resolved against it cancels "homes" then "unknown", landing back
+        // at <datadir> itself before descending into a new "evil" folder -- i.e.
+        // <datadir>/evil, a sibling of the "unknown" workspace directory. Pre-fix,
+        // createFolder() built this same string via `fixPath(getDatadir() + path)` with no
+        // bounds check and unconditionally called mkdirs() on it, which would have created
+        // exactly this directory; that sibling must never be created.
+        File escaped = new File(datadir, "evil");
+        if (escaped.exists()) {
+            escaped.delete();
+            fail("createUser must not create a folder outside the repo root; found: " + escaped.getAbsolutePath());
+        }
+    }
+
+    @Test
+    public void createUser_creates_legitimate_home_folder_inside_datadir() throws Exception {
+        // Positive control for the traversal guard above: the guard must not false-positive on
+        // ordinary, non-traversal input -- an ordinary username must still get its home folder.
+        manager.createUser("normaluser");
+
+        File expected = new File(datadir, "unknown/homes/normaluser");
+        if (!expected.isDirectory()) {
+            fail("createUser must create the user's home folder inside the datadir. Expected at "
+                    + expected.getAbsolutePath()
+                    + " but it is missing.");
+        }
+    }
+
+    // --- saiku#1907 (c): createUser username must be a single safe path segment ---
+
+    /**
+     * saiku#1907: a {@code ..} segment that stays INSIDE the datadir is not caught
+     * by the #1906 createFolder escape guard, so {@code createUser("../datasources")}
+     * would resolve to another repo folder and rewrite its {@code acl.json} (planting
+     * the caller as PRIVATE owner). The username-segment guard must reject it
+     * fail-closed, leaving the target folder's ACL untouched.
+     */
+    @Test
+    public void createUser_rejects_inside_datadir_traversal_targeting_another_folder() throws Exception {
+        // A folder inside the datadir with its own ACL — stands in for /datasources
+        // or a victim's home. It must survive the malicious createUser untouched.
+        File victim = new File(datadir, "unknown/datasources");
+        if (!victim.mkdirs()) {
+            throw new IllegalStateException("Could not create " + victim);
+        }
+        File aclJson = new File(victim, "acl.json");
+        String original = "{\"" + victim.getPath().replace("\\", "\\\\").replace("\"", "\\\"")
+                + "\":{\"owner\":\"admin\",\"type\":\"SECURED\",\"roles\":null,\"users\":null}}";
+        Files.write(aclJson.toPath(), original.getBytes(StandardCharsets.UTF_8));
+
+        try {
+            manager.createUser("../datasources");
+            fail("createUser must reject a username containing a .. traversal segment");
+        } catch (RuntimeException expected) {
+            // fail-closed (SaikuServiceException)
+        }
+
+        String after = new String(Files.readAllBytes(aclJson.toPath()), StandardCharsets.UTF_8);
+        assertEquals("the target folder's acl.json must be left untouched", original, after);
+    }
+
+    /**
+     * A username carrying a path separator ({@code a/b}) must be rejected — it would
+     * otherwise create a nested folder under {@code /homes} rather than a single home.
+     */
+    @Test
+    public void createUser_rejects_nested_path_segment() throws Exception {
+        try {
+            manager.createUser("a/b");
+            fail("createUser must reject a username containing a path separator");
+        } catch (RuntimeException expected) {
+            // fail-closed
+        }
+        assertFalse("no nested home may be created", new File(datadir, "unknown/homes/a/b").exists());
+        assertFalse("no intermediate home segment may be created", new File(datadir, "unknown/homes/a").exists());
+    }
+
+    /**
+     * Positive control: an ordinary username must still get its home folder — the
+     * guard must not false-positive on safe input.
+     */
+    @Test
+    public void createUser_accepts_ordinary_username() throws Exception {
+        manager.createUser("normal");
+        assertTrue(
+                "an ordinary username must still create its home folder",
+                new File(datadir, "unknown/homes/normal").isDirectory());
+    }
+
+    /**
+     * saiku#1907 F1: a trailing-dot username ("alice.") normalises to "alice" on Win32,
+     * so it would rewrite alice's home acl.json (owner takeover + owner lockout). It must
+     * be rejected AND alice's existing acl.json left untouched.
+     */
+    @Test
+    public void createUser_rejects_trailing_dot_username_and_preserves_victim_acl() throws Exception {
+        File aliceHome = new File(datadir, "unknown/homes/alice");
+        if (!aliceHome.mkdirs()) {
+            throw new IllegalStateException("Could not create " + aliceHome);
+        }
+        File aclJson = new File(aliceHome, "acl.json");
+        String original = "{\"" + aliceHome.getPath().replace("\\", "\\\\").replace("\"", "\\\"")
+                + "\":{\"owner\":\"alice\",\"type\":\"PRIVATE\",\"roles\":null,\"users\":null}}";
+        Files.write(aclJson.toPath(), original.getBytes(StandardCharsets.UTF_8));
+
+        try {
+            manager.createUser("alice.");
+            fail("createUser must reject a trailing-dot username (Win32 normalises it to 'alice')");
+        } catch (RuntimeException expected) {
+            // fail-closed
+        }
+
+        String after = new String(Files.readAllBytes(aclJson.toPath()), StandardCharsets.UTF_8);
+        assertEquals("alice's acl.json must be left untouched", original, after);
+    }
+
+    /**
+     * saiku#1907 F1: a trailing-space username ("alice ") normalises to "alice" on Win32 (NTFS
+     * silently drops a trailing space, same as a trailing dot), so it must be rejected too — same
+     * guard ({@code stripWindowsFilenameTail}), same victim-ACL-untouched requirement as the
+     * trailing-dot case above. Distinct from {@code createUser_rejects_colon_home_prefix_and_blank_usernames}'s
+     * all-whitespace ("   ") case, which is caught by the earlier blank check rather than this one.
+     */
+    @Test
+    public void createUser_rejects_trailing_space_username_and_preserves_victim_acl() throws Exception {
+        File aliceHome = new File(datadir, "unknown/homes/alice");
+        if (!aliceHome.mkdirs()) {
+            throw new IllegalStateException("Could not create " + aliceHome);
+        }
+        File aclJson = new File(aliceHome, "acl.json");
+        String original = "{\"" + aliceHome.getPath().replace("\\", "\\\\").replace("\"", "\\\"")
+                + "\":{\"owner\":\"alice\",\"type\":\"PRIVATE\",\"roles\":null,\"users\":null}}";
+        Files.write(aclJson.toPath(), original.getBytes(StandardCharsets.UTF_8));
+
+        try {
+            manager.createUser("alice ");
+            fail("createUser must reject a trailing-space username (Win32 normalises it to 'alice')");
+        } catch (RuntimeException expected) {
+            // fail-closed
+        }
+
+        String after = new String(Files.readAllBytes(aclJson.toPath()), StandardCharsets.UTF_8);
+        assertEquals("alice's acl.json must be left untouched", original, after);
+    }
+
+    /**
+     * saiku#1907 F1: a colon (Win32 drive/ADS separator), a "home:"-prefixed spelling,
+     * and blank/whitespace usernames must all be rejected fail-closed.
+     */
+    @Test
+    public void createUser_rejects_colon_home_prefix_and_blank_usernames() throws Exception {
+        for (String bad : new String[] {"a:b", "home:alice", "", "   "}) {
+            try {
+                manager.createUser(bad);
+                fail("createUser must reject username: [" + bad + "]");
+            } catch (RuntimeException expected) {
+                // fail-closed
+            }
+        }
     }
 
     // --- helpers -------------------------------------------------------------

@@ -21,6 +21,7 @@ import java.util.Map;
 import org.saiku.repository.AclEntry;
 import org.saiku.service.datasource.DatasourceService;
 import org.saiku.service.user.UserService;
+import org.saiku.service.util.security.Usernames;
 import org.saiku.web.embed.EmbedPublicGrant;
 import org.saiku.web.embed.EmbedPublicRegistry;
 import org.saiku.web.embed.EmbedToken;
@@ -243,7 +244,7 @@ public class EmbedTokenResource {
         }
         String username = currentUsername();
         List<String> roles = currentRoles();
-        boolean canManage = (username != null && username.equals(t.createdBy))
+        boolean canManage = Usernames.sameUser(username, t.createdBy)
                 || isAdmin(roles)
                 || hasGrant(t.resourcePath, username, roles);
         if (!canManage) {
@@ -368,9 +369,8 @@ public class EmbedTokenResource {
         }
         String username = currentUsername();
         List<String> roles = currentRoles();
-        boolean canManage = (username != null && username.equals(existing.grantedBy))
-                || isAdmin(roles)
-                || hasGrant(path, username, roles);
+        boolean canManage =
+                Usernames.sameUser(username, existing.grantedBy) || isAdmin(roles) || hasGrant(path, username, roles);
         if (!canManage) {
             return forbidden("You can't revoke this public grant");
         }
@@ -452,12 +452,11 @@ public class EmbedTokenResource {
         return u == null ? null : u.toString();
     }
 
-    @SuppressWarnings("unchecked")
+    // saiku#1752: roles come from the single authoritative SecurityContextHolder reader, not the
+    // lazily-seeded session "roles" map (see SessionRoles / saiku#1747). ROLE_EMBED_GUEST is carried
+    // as a SecurityContextHolder authority on the guest principal, so it resolves here identically.
     private List<String> currentRoles() {
-        if (sessionService == null) return List.of();
-        Object r = sessionService.getAllSessionObjects().get("roles");
-        if (r instanceof List<?>) return (List<String>) r;
-        return List.of();
+        return org.saiku.web.rest.util.SessionRoles.currentRoles();
     }
 
     private static Response badRequest(String field, String message) {

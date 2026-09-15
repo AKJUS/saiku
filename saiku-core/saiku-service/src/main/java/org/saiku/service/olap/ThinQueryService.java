@@ -505,7 +505,7 @@ public class ThinQueryService implements Serializable {
                     + "ms\tFormat:\t" + (format - exec) + "ms\tTotals:\t" + (totals - format) + "ms\t Total: "
                     + (totals - start) + "ms");
 
-            result.setRuntime(new Double(format - start).intValue());
+            result.setRuntime((int) (format - start)); // saiku#1036: new Double(...) is deprecated-for-removal
             log.info(
                     "saiku.query.executed format=json cacheHit=false bytes=-1 runtimeMs={} rows={} queryName={}",
                     (totals - start),
@@ -959,6 +959,11 @@ public class ThinQueryService implements Serializable {
             final Writer writer = new StringWriter();
             sn.getFilterAxis().unparse(new ParseTreeWriter(new PrintWriter(writer)));
             if (StringUtils.isNotBlank(writer.toString())) {
+                // saiku#1714: this WHERE may carry a compound slicer (a set — e.g. two
+                // members of the same dimension on the filter axis). The Mondrian fork
+                // executes it correctly with exact totals, but returns its aggregated
+                // drillthrough projection (grouped rows) instead of raw fact rows.
+                // Pinned in DrillthroughIT.
                 buf.append("WHERE ").append(writer.toString());
             }
             select = buf.toString();
@@ -1105,7 +1110,6 @@ public class ThinQueryService implements Serializable {
                 rowsIndex = (rowsIndex + 1) & 1;
             }
 
-            // TODO - refactor this using axis ordinals etc.
             final AxisInfo[] axisInfos = new AxisInfo[] {
                 new AxisInfo(cellSet.getAxes().get(rowsIndex)),
                 new AxisInfo(cellSet.getAxes().get((rowsIndex + 1) & 1))

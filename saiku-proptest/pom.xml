@@ -7,11 +7,11 @@
   <parent>
     <groupId>org.saikuanalytics</groupId>
     <artifactId>saiku</artifactId>
-    <version>4.7.1</version>
+    <version>4.8.0</version>
   </parent>
 
   <artifactId>saiku-proptest</artifactId>
-  <version>4.7.1</version>
+  <version>4.8.0</version>
   <packaging>jar</packaging>
   <name>saiku-proptest</name>
   <description>
@@ -31,7 +31,7 @@
       <dependency>
         <groupId>org.saikuanalytics</groupId>
         <artifactId>saiku-bom</artifactId>
-        <version>4.7.1</version>
+        <version>4.8.0</version>
         <type>pom</type>
         <scope>import</scope>
       </dependency>
@@ -66,6 +66,14 @@
     <dependency>
       <groupId>org.saikuanalytics</groupId>
       <artifactId>saiku-sql</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <!-- saiku#1852: the YAML semantic layer had no property coverage at all, largely because
+         this module couldn't see it. -->
+    <dependency>
+      <groupId>org.saikuanalytics</groupId>
+      <artifactId>saiku-semantic</artifactId>
       <version>${project.version}</version>
       <scope>test</scope>
     </dependency>

@@ -44,19 +44,50 @@ public class AiCell {
     @JsonInclude(JsonInclude.Include.NON_DEFAULT)
     private boolean suppressed;
 
+    /** saiku#1780 — populated when a requested measure produced NO column in
+     *  the result because it has no join path to a filtered/sliced dimension.
+     *  Rather than silently omitting the measure (the agent then gets fewer
+     *  columns than it asked for, with no explanation), we surface an explicit
+     *  cell whose {@link #value}/{@link #formatted} are null and whose
+     *  {@code unavailable} carries a machine-readable reason, e.g.
+     *  {@code "no join path to filtered dimension(s): Warehouse"}. Mirrors the
+     *  VALIDATION_ERROR self-description style so an agent can act on it.
+     *  {@code NON_NULL} so ordinary cells stay lean on the wire. */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private String unavailable;
+
     public AiCell() {}
 
     public AiCell(Double value, String formatted, String unit) {
-        this.value = value;
+        this.value = finiteOrNull(value);
         this.formatted = formatted;
         this.unit = unit;
     }
 
     public AiCell(Double value, String formatted, String unit, Map<String, String> properties) {
-        this.value = value;
+        this.value = finiteOrNull(value);
         this.formatted = formatted;
         this.unit = unit;
         this.properties = properties;
+    }
+
+    /**
+     * saiku#1780 — collapse non-finite results to null.
+     *
+     * <p>A divide-by-zero calculated measure (FoodMart's {@code Stock To Sales
+     * Ratio} sliced by a warehouse geography, for instance) evaluates to
+     * {@code Infinity}. Jackson serialises that as the bare token {@code Infinity},
+     * which is not valid JSON per RFC 8259 — strict parsers reject the whole
+     * response — and any client lenient enough to accept it then renders the
+     * literal text "Infinity" in a KPI headline or a table cell.
+     *
+     * <p>Null is the honest answer: the ratio is undefined, exactly like a
+     * missing cell. {@code formatted} is left alone so the server's own rendering
+     * of the cell is still visible to anyone debugging.
+     */
+    private static Double finiteOrNull(Double v) {
+        if (v == null || v.isNaN() || v.isInfinite()) return null;
+        return v;
     }
 
     public Double getValue() {
@@ -64,7 +95,7 @@ public class AiCell {
     }
 
     public void setValue(Double v) {
-        this.value = v;
+        this.value = finiteOrNull(v);
     }
 
     public String getFormatted() {
@@ -105,6 +136,26 @@ public class AiCell {
 
     public void setSuppressed(boolean v) {
         this.suppressed = v;
+    }
+
+    public String getUnavailable() {
+        return unavailable;
+    }
+
+    public void setUnavailable(String v) {
+        this.unavailable = v;
+    }
+
+    /**
+     * saiku#1780 — build a self-describing "unavailable measure" cell: null
+     * value/formatted, with a machine-readable reason. Used when a requested
+     * measure has no join path to a filtered/sliced dimension and Mondrian
+     * therefore drops it from the result entirely.
+     */
+    public static AiCell unavailable(String reason) {
+        AiCell c = new AiCell(null, null, null);
+        c.unavailable = reason;
+        return c;
     }
 
     /** Best-effort: parse a Mondrian-formatted string back into a Double,

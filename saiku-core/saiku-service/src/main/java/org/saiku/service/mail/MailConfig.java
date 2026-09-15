@@ -1,3 +1,7 @@
+/*
+ *   Copyright 2026 Spicule Ltd
+ *   Apache License, Version 2.0.
+ */
 package org.saiku.service.mail;
 
 import java.util.function.Function;
@@ -16,6 +20,20 @@ public record MailConfig(
     /** Configured only when a host and a from-address are both present. */
     public boolean isConfigured() {
         return notBlank(host) && notBlank(from);
+    }
+
+    /**
+     * Redacted {@code toString()} — the SMTP {@link #password()} is NEVER printed (saiku#943 P0-B,
+     * SEC). A record's generated {@code toString()} would otherwise render the plaintext password, so
+     * a stray {@code log.info("... {}", mailConfig)} anywhere would leak the credential. Overriding
+     * here closes that at the source rather than relying on every call site to remember not to log
+     * the instance. {@code passwordSet} shows presence without the value.
+     */
+    @Override
+    public String toString() {
+        return "MailConfig[host=" + host + ", port=" + port + ", username=" + username + ", passwordSet="
+                + notBlank(password) + ", from=" + from + ", startTls=" + startTls + ", ssl=" + ssl + ", selfTo="
+                + selfTo + "]";
     }
 
     /**

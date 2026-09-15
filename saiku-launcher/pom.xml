@@ -6,7 +6,7 @@
     <parent>
         <groupId>org.saikuanalytics</groupId>
         <artifactId>saiku</artifactId>
-        <version>4.7.1</version>
+        <version>4.8.0</version>
     </parent>
 
     <artifactId>saiku-launcher</artifactId>
@@ -16,8 +16,12 @@
 
     <properties>
         <jetty.version>12.1.10</jetty.version>
-        <picocli.version>4.7.6</picocli.version>
+        <picocli.version>4.7.7</picocli.version>
         <maven.compiler.release>21</maven.compiler.release>
+        <!-- Default: skip launcher ITs so a bare local `mvn verify` stays fast.
+             CI passes `-DskipITs=false` to flip them on; the `integration`
+             profile also flips them (via its own override) for local runs. -->
+        <skipITs>true</skipITs>
     </properties>
 
     <dependencies>
@@ -201,7 +205,7 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-failsafe-plugin</artifactId>
-                <version>3.5.2</version>
+                <version>3.6.0</version>
                 <executions>
                     <execution>
                         <goals>
@@ -218,14 +222,18 @@
                     <forkCount>1</forkCount>
                     <reuseForks>true</reuseForks>
                     <argLine>--add-opens=java.base/java.nio=ALL-UNNAMED</argLine>
-                    <!-- Default skip; the {@code integration} profile flips this on. -->
-                    <skipITs>true</skipITs>
+                    <!-- Skip driven by the ${skipITs} property (default true in
+                         <properties>). CI's `-DskipITs=false` and the
+                         {@code integration} profile both flip it on. A literal
+                         `true` here beat the CLI flag and kept CI from ever
+                         running these ITs — hence the property indirection. -->
+                    <skipITs>${skipITs}</skipITs>
                 </configuration>
             </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>
-                <version>3.6.0</version>
+                <version>3.6.2</version>
                 <executions>
                     <execution>
                         <phase>package</phase>

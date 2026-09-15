@@ -60,7 +60,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Set up JDK 22
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6.0.0
         with:
           distribution: temurin
           java-version: "22"
@@ -87,6 +87,12 @@ jobs:
             </servers>
           </settings>
           EOF
+      - name: Check licence headers
+        # Presence-check only: the tree carries Spicule, OSBI, Stoellberger and
+        # Pentaho EPL headers that must not be homogenised, which is why Spotless's
+        # <licenseHeader> is not used here. See scripts/check-licence-headers.sh.
+        run: ./scripts/check-licence-headers.sh
+
       - name: mvn verify
         # spotless:check is bound to the verify phase by the root pom's
         # <execution>, so `mvn verify` covers formatting too. A standalone
@@ -129,10 +135,10 @@ jobs:
         working-directory: saiku-ui
     steps:
       - uses: actions/checkout@v7
-      - name: Set up Node 20
+      - name: Set up Node 24
         uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "24"
           cache: npm
           cache-dependency-path: saiku-ui/package-lock.json
       - name: Install deps
@@ -161,7 +167,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Set up JDK 22
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6.0.0
         with:
           distribution: temurin
           java-version: "22"

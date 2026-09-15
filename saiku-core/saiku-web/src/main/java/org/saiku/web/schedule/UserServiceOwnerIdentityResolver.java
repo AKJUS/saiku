@@ -1,0 +1,80 @@
+/*
+ *   Copyright 2026 Spicule Ltd
+ *   Apache License, Version 2.0.
+ */
+package org.saiku.web.schedule;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import org.saiku.database.dto.SaikuUser;
+import org.saiku.service.user.UserService;
+import org.saiku.service.util.security.Usernames;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * {@link OwnerIdentityResolver} backed by the authoritative {@link UserService} (saiku#1809, PR3).
+ * Looks the owner up by username in the user store and, if present, re-reads its CURRENT roles live —
+ * so a role an admin revoked between job-create and job-run is absent from the resolved identity.
+ *
+ * <p><b>Fail-closed.</b> An unknown username, a blank username, or any lookup error resolves to
+ * {@link OwnerIdentity#absent()} — the runner then refuses to run and auto-disables the job. This
+ * resolver never returns a best-effort grant.
+ *
+ * <p><b>PR4 enabled-gate.</b> {@link OwnerIdentity#present()} means the owner EXISTS <b>and</b> is
+ * ENABLED. The account's enabled state comes from the authoritative {@code USERS.ENABLED} column,
+ * surfaced onto {@link SaikuUser#isEnabled()} in PR4 (the column already existed and is written on
+ * every create/update; PR3 simply hadn't mapped it). A present-but-disabled account resolves {@link
+ * OwnerIdentity#absent()}, so its jobs never run and are auto-disabled by the engine.
+ */
+public final class UserServiceOwnerIdentityResolver implements OwnerIdentityResolver {
+
+    private static final Logger log = LoggerFactory.getLogger(UserServiceOwnerIdentityResolver.class);
+
+    private final UserService userService;
+
+    public UserServiceOwnerIdentityResolver(UserService userService) {
+        if (userService == null) {
+            throw new IllegalArgumentException("userService is required");
+        }
+        this.userService = userService;
+    }
+
+    @Override
+    public OwnerIdentity resolve(String username) {
+        if (username == null || username.isBlank()) {
+            return OwnerIdentity.absent();
+        }
+        try {
+            SaikuUser owner = null;
+            for (SaikuUser u : userService.getUsers()) {
+                // saiku#1907 F4: case-insensitive owner match, so a job owned by a mixed-case
+                // account name resolves rather than fail-closing to absent (skip + auto-disable).
+                if (u != null && Usernames.sameUser(username, u.getUsername())) {
+                    owner = u;
+                    break;
+                }
+            }
+            if (owner == null) {
+                log.debug("Owner '{}' not found in user store — resolving absent (fail-closed)", username);
+                return OwnerIdentity.absent();
+            }
+            // saiku#1809 PR4: EXISTS is not enough — the account must also be ENABLED. A disabled owner
+            // (USERS.ENABLED = 0) resolves absent, so the engine SKIPs + auto-disables the job at once.
+            if (!owner.isEnabled()) {
+                log.debug("Owner '{}' is disabled — resolving absent (fail-closed)", username);
+                return OwnerIdentity.absent();
+            }
+            // Re-read CURRENT roles live — never a stale snapshot. getRoles reflects the store as of
+            // now, so a revoked role is already gone.
+            String[] current = userService.getRoles(owner);
+            List<String> roles = current == null ? new ArrayList<>() : new ArrayList<>(Arrays.asList(current));
+            return OwnerIdentity.present(roles);
+        } catch (Exception e) {
+            // Any failure resolving the owner is treated as "unavailable" — fail closed, never run.
+            log.warn("Failed to resolve owner '{}' — resolving absent (fail-closed): {}", username, e.toString());
+            return OwnerIdentity.absent();
+        }
+    }
+}

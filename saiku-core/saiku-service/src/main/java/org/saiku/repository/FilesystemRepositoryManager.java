@@ -30,6 +30,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.UnsupportedEncodingException;
 import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
@@ -39,6 +40,7 @@ import org.saiku.database.dto.MondrianSchema;
 import org.saiku.datasources.connection.RepositoryFile;
 import org.saiku.service.user.UserService;
 import org.saiku.service.util.exception.SaikuServiceException;
+import org.saiku.service.util.security.Usernames;
 import org.saiku.service.util.xml.SecureXml;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -49,6 +51,20 @@ import org.slf4j.LoggerFactory;
 public class FilesystemRepositoryManager implements IRepositoryManager {
     private static final String ORBIS_WORKSPACE_DIR = "workspace";
     private static final Logger log = LoggerFactory.getLogger(FilesystemRepositoryManager.class);
+
+    /**
+     * Opt back in to the legacy {@code <workspace>_<name>} decoration on loaded datasource names
+     * (saiku#1871). Off by default: in single-tenant OSS the workspace directory is always the
+     * default {@code unknown}, so the prefix only ever added noise.
+     *
+     * <p>Read per call rather than cached so a test — or an operator debugging a migration — can
+     * flip it without a restart. This runs once per datasource per load, not per request.
+     */
+    public static final String WORKSPACE_PREFIX_PROPERTY = "saiku.datasources.workspacePrefix";
+
+    static boolean isWorkspacePrefixEnabled() {
+        return Boolean.parseBoolean(System.getProperty(WORKSPACE_PREFIX_PROPERTY, "false"));
+    }
 
     private static FilesystemRepositoryManager ref;
     private final String defaultRole;
@@ -117,8 +133,12 @@ public class FilesystemRepositoryManager implements IRepositoryManager {
      * <ul>
      *   <li><b>/homes/</b> — SECURED, defaultRole READ. Per-user PRIVATE folders
      *       are added on first login via {@link #createUser(String)}.</li>
-     *   <li><b>/datasources/</b> — PUBLIC, ROLE_ADMIN WRITE/READ/GRANT. Authenticated
-     *       users can READ (rootMethod fallback); only admins mutate.</li>
+     *   <li><b>/datasources/</b> — SECURED, ROLE_ADMIN WRITE/READ/GRANT, nothing for anyone
+     *       else. saiku#1904: this was PUBLIC, and PUBLIC resolved to WRITE for every
+     *       authenticated user, so any account could drop a datasource descriptor here
+     *       (the write half of the saiku#1902/#1903 RCE chain). Descriptors carry warehouse
+     *       credentials and are consumed server-side, so non-admins have no reason to see
+     *       them either.</li>
      *   <li><b>/dashboards/</b> — SECURED, ROLE_ADMIN WRITE/READ/GRANT. User-saved
      *       dashboards live under {@code /homes/<user>/} where the home ACL applies;
      *       the top-level folder is admin-only-write to prevent cross-user clobber
@@ -126,7 +146,8 @@ public class FilesystemRepositoryManager implements IRepositoryManager {
      *   <li><b>/queries/</b> — SECURED, ROLE_ADMIN WRITE/READ/GRANT. Same rationale
      *       as {@code /dashboards/}.</li>
      *   <li><b>/legacyreports/</b> — PUBLIC, ROLE_ADMIN WRITE/READ/GRANT. Mirrors
-     *       historical behaviour.</li>
+     *       historical behaviour; since saiku#1904 PUBLIC grants READ, not WRITE, to
+     *       non-admins.</li>
      * </ul>
      *
      * <p>Historical bug fixed inline: prior code captured one {@code File n} for
@@ -137,7 +158,9 @@ public class FilesystemRepositoryManager implements IRepositoryManager {
      */
     private void seedSkeleton() throws RepositoryException {
         seedAcl(this.createFolder(sep + "homes"), homesGrant());
-        seedAcl(this.createFolder(sep + "datasources"), publicAdminGrant());
+        // saiku#1904: admin-only. Re-applied on every start(), so an established home is
+        // tightened on its next boot without a migration step.
+        seedAcl(this.createFolder(sep + "datasources"), securedAdminGrant());
         seedAcl(this.createFolder(sep + "dashboards"), securedAdminGrant());
         seedAcl(this.createFolder(sep + "queries"), securedAdminGrant());
         seedAcl(this.createFolder(sep + "legacyreports"), publicAdminGrant());
@@ -180,14 +203,184 @@ public class FilesystemRepositoryManager implements IRepositoryManager {
     }
 
     public void createUser(String u) throws RepositoryException {
+        // saiku#1907: the username is concatenated into "/homes/" + u to build the
+        // home path. The #1906 createFolder guard rejects a path that ESCAPES the
+        // datadir, but a ".." (or a separator) that stays INSIDE it — e.g.
+        // "../datasources" or "a/b" — resolves to another folder within the repo,
+        // letting createUser rewrite that folder's acl.json and plant the caller as
+        // its PRIVATE owner. Require the username to be a single safe path segment
+        // before it is ever used to build a path. Fail closed.
+        validateUsernameSegment(u);
 
-        File node = this.createFolder(sep + "homes" + sep + u);
+        // saiku#1907 F4: reuse (and rename to canonical) an existing case-variant home instead of
+        // creating a divergent duplicate, so a pre-existing mixed-case home (/homes/Admin) becomes
+        // the user's single canonical home (/homes/admin) and its content stays reachable.
+        File homesDir = this.createFolder(sep + "homes");
+        File node = resolveHomeFolder(homesDir, u);
 
-        AclEntry e = new AclEntry(u, AclType.PRIVATE, null, null);
+        // saiku#1907 N2: the resolved home's REAL on-disk (canonical) name must match the identity.
+        // Defeats Win32 8.3 short-name / trailing-dot / ADS aliasing (and symlink aliasing) onto an
+        // entry-less namesake home — e.g. createUser("BOBBYV~1") resolving onto /homes/bobbyvonsmith
+        // and stamping owner="BOBBYV~1" (takeover). Entry-less homes are common in a moved/restored
+        // datadir. Fail closed.
+        if (!homeNameMatches(node, u)) {
+            throw new SaikuServiceException("Home folder name does not match the resolved identity");
+        }
 
+        // saiku#1907 F5: the folder NAME is the ownership authority (ownsHome already treats it so).
         Acl2 acl2 = new Acl2(node);
-        acl2.addEntry(node.getPath(), e);
+        AclEntry existing = acl2.getEntry(node.getPath());
+        if (existing != null && Usernames.sameUser(existing.getOwner(), u)) {
+            return; // owner already correct — non-clobbering (preserves user-set shares on the home).
+        }
+        if (existing != null) {
+            // A foreign/stale owner (planted state, or a stale absolute key surfaced by a rename):
+            // RESTORE ownership to the namesake and self-heal. The previous throw was silently
+            // swallowed by SessionResource and made planted bad state permanent, while protecting
+            // nothing (two distinct case-variant external accounts still canonicalise to one
+            // identity). Log WARN so operators see it.
+            log.warn(
+                    "Restoring ownership of home '{}' to '{}' (was '{}') — saiku#1907 F5",
+                    node.getName(),
+                    u,
+                    existing.getOwner());
+        }
+        acl2.addEntry(node.getPath(), new AclEntry(u, AclType.PRIVATE, null, null));
         acl2.serialize(node);
+    }
+
+    /**
+     * Resolve the home folder for {@code u}: the exact {@code /homes/<u>} when it exists, else a
+     * case-variant sibling ({@code /homes/Admin} for {@code admin}) RENAMED to the canonical name
+     * so {@code /homes/<canonical>} is authoritative for the UI (saiku#1907 F4), else a freshly
+     * created {@code /homes/<u>}.
+     */
+    private File resolveHomeFolder(File homesDir, String u) {
+        File exact = new File(homesDir, u);
+        if (exact.isDirectory()) {
+            return exact;
+        }
+        File variant = findCaseVariantHome(homesDir, u);
+        if (variant == null) {
+            return this.createFolder(sep + "homes" + sep + u); // fresh home
+        }
+        log.info("Reusing case-variant home '{}' for identity '{}' (saiku#1907 F4)", variant.getName(), u);
+        return renameHomeToCanonical(variant, new File(homesDir, u));
+    }
+
+    /**
+     * The single {@code /homes} subfolder whose name is a case-variant of {@code u} (not the exact
+     * name), or null. Deterministic when several exist: sorted by name, first wins, WARN logged
+     * (saiku#1907 N4).
+     */
+    private static File findCaseVariantHome(File homesDir, String u) {
+        File[] children = homesDir.listFiles();
+        if (children == null) {
+            return null;
+        }
+        List<File> variants = new ArrayList<>();
+        for (File c : children) {
+            if (c.isDirectory() && !c.getName().equals(u) && Usernames.sameUser(c.getName(), u)) {
+                variants.add(c);
+            }
+        }
+        if (variants.isEmpty()) {
+            return null;
+        }
+        variants.sort(java.util.Comparator.comparing(File::getName));
+        if (variants.size() > 1) {
+            log.warn(
+                    "Multiple case-variant homes for '{}': {} — using '{}'",
+                    u,
+                    variants,
+                    variants.get(0).getName());
+        }
+        return variants.get(0);
+    }
+
+    /**
+     * saiku#1907 F4: rename a case-variant home to its canonical name so {@code /homes/<canonical>}
+     * is authoritative (the UI addresses a home by the canonical identity, so a left-behind
+     * {@code /homes/Admin} made {@code getAllFiles("/homes/admin")} null and the next save recreate a
+     * duplicate). Guarded and best-effort — on any failure the variant is used in place. On success
+     * the stale absolute-path ACL keys inside are re-keyed to the new path; {@code createUser} then
+     * re-stamps the folder's own entry.
+     */
+    private File renameHomeToCanonical(File variant, File canonical) {
+        try {
+            if (canonical.exists()) {
+                return variant; // canonical already present (race / case-insensitive FS) — use in place
+            }
+            String oldPrefix = canonicalPathString(variant);
+            if (variant.renameTo(canonical)) {
+                log.warn(
+                        "Renamed case-variant home '{}' to canonical '{}' (saiku#1907 F4)",
+                        variant.getName(),
+                        canonical.getName());
+                Acl2.rekeyAclPaths(canonical, oldPrefix, canonicalPathString(canonical));
+                return canonical;
+            }
+            log.warn(
+                    "Could not rename case-variant home '{}' to '{}'; using it in place",
+                    variant.getName(),
+                    canonical.getName());
+        } catch (Exception e) {
+            log.warn("Home rename failed for '{}'; using it in place", variant.getName(), e);
+        }
+        return variant;
+    }
+
+    /** saiku#1907 N2: does the home's REAL on-disk (canonical) leaf name match the identity {@code u}? */
+    private static boolean homeNameMatches(File node, String u) {
+        try {
+            return Usernames.sameUser(node.getCanonicalFile().getName(), u);
+        } catch (Exception e) {
+            return Usernames.sameUser(node.getName(), u);
+        }
+    }
+
+    /**
+     * saiku#1907: validate that {@code u} is a single safe path segment usable as a
+     * home-folder name — no separators ({@code /} or {@code \}), no {@code ..}
+     * traversal, no leading dot ({@code .} / {@code ..} / hidden segments), and no
+     * control characters. Rejects fail-closed with a {@link SaikuServiceException}.
+     * This is the choke point every login / admin add-user path funnels through
+     * ({@link org.saiku.service.user.UserService#addUser} and the {@code checkFolders}
+     * first-login home creation both reach {@code createUser}).
+     */
+    private static void validateUsernameSegment(String u) {
+        if (u == null || u.trim().isEmpty()) {
+            throw new SaikuServiceException("Invalid username for home folder");
+        }
+        // saiku#1907 F1: Win32 silently strips trailing dots/spaces and treats ':' as a
+        // drive/ADS separator, so a username that normalises to a DIFFERENT on-disk name is
+        // a traversal in disguise — e.g. "alice." lands on disk as "alice" and would let
+        // createUser rewrite alice's acl.json (home takeover + owner lockout). Reject any
+        // username whose Win32-normalised form differs from itself.
+        if (!stripWindowsFilenameTail(u).equals(u)) {
+            throw new SaikuServiceException("Invalid username for home folder");
+        }
+        if (u.indexOf('/') >= 0
+                || u.indexOf('\\') >= 0
+                || u.indexOf(':') >= 0
+                || u.contains("..")
+                || u.charAt(0) == '.'
+                // saiku#1907 N4: reject a leading space (Win32 keeps it, but it aliases visually
+                // and is never a legitimate account name); trailing space is caught above.
+                || Character.isWhitespace(u.charAt(0))) {
+            throw new SaikuServiceException("Invalid username for home folder");
+        }
+        // Reject the "home:" folder-name convention as a raw username (it is added by the
+        // repository layer, never a legitimate account name).
+        if (u.toLowerCase(java.util.Locale.ROOT).startsWith("home:")) {
+            throw new SaikuServiceException("Invalid username for home folder");
+        }
+        for (int i = 0; i < u.length(); i++) {
+            char c = u.charAt(i);
+            if (c < 0x20 || c == 0x7f) {
+                throw new SaikuServiceException("Invalid username for home folder");
+            }
+        }
     }
 
     public Object getHomeFolders() throws RepositoryException {
@@ -233,15 +426,85 @@ public class FilesystemRepositoryManager implements IRepositoryManager {
         return false;
     }
 
+    /**
+     * saiku#1903: is {@code path} a datasource descriptor ({@code *.sds}, any case) or anything
+     * under the {@code /datasources} tree? Both are consumed by the datasource loader, which lists
+     * {@code *.sds} recursively across the whole datadir — so a descriptor written into a user's
+     * own home is loaded (and its JDBC URL connected) exactly like one in {@code /datasources}.
+     *
+     * <p>The check is made against the name the file would actually have <em>on disk</em>: Win32
+     * silently strips trailing dots and spaces and treats an NTFS alternate-data-stream suffix as
+     * the base file, so {@code evil.sds.}, {@code "evil.sds "} and {@code evil.sds::$DATA} all land
+     * as {@code evil.sds} and would otherwise slip past a naive {@code endsWith(".sds")}.
+     */
+    static boolean isDatasourceDescriptorPath(String path) {
+        if (path == null) {
+            return false;
+        }
+        String p = path.replace('\\', '/').trim().toLowerCase(java.util.Locale.ROOT);
+        while (p.startsWith("./")) {
+            p = p.substring(2);
+        }
+        p = stripWindowsFilenameTail(p);
+        if (p.endsWith(".sds")) {
+            return true;
+        }
+        String noLead = p.startsWith("/") ? p.substring(1) : p;
+        return noLead.equals("datasources") || noLead.startsWith("datasources/") || p.contains("/datasources/");
+    }
+
+    /**
+     * Normalise a repository path to the name Win32 would actually create on disk: drop an NTFS
+     * alternate-data-stream suffix on the final segment (everything from the first {@code :} after
+     * the last {@code /} — repository paths are relative, so there is no drive-letter colon), then
+     * strip trailing dots and spaces. Shared by both saiku#1903 descriptor guards.
+     */
+    static String stripWindowsFilenameTail(String p) {
+        int lastSlash = p.lastIndexOf('/');
+        int colon = p.indexOf(':', lastSlash + 1);
+        if (colon >= 0) {
+            p = p.substring(0, colon);
+        }
+        int end = p.length();
+        while (end > 0 && (p.charAt(end - 1) == '.' || p.charAt(end - 1) == ' ')) {
+            end--;
+        }
+        return p.substring(0, end);
+    }
+
+    /**
+     * Refuse a descriptor write unless {@code roles} carries an admin role. Enforced here — the
+     * layer every REST save/move funnels through — rather than only at the resource, so a new
+     * caller can't reopen the write half of the saiku#1902 chain by accident. Admin-side writes
+     * ({@code saveDataSource}, internal files) don't pass through here and are unaffected.
+     */
+    private void requireAdminForDatasourceDescriptor(String path, List<String> roles) {
+        if (!isDatasourceDescriptorPath(path)) {
+            return;
+        }
+        List<String> adminRoles = userService != null ? userService.getAdminRoles() : null;
+        if (adminRoles == null || adminRoles.isEmpty()) {
+            adminRoles = java.util.Collections.singletonList("ROLE_ADMIN");
+        }
+        if (roles != null && !java.util.Collections.disjoint(roles, adminRoles)) {
+            return;
+        }
+        log.warn("Refused non-admin write of a datasource descriptor (saiku#1903): {}", path);
+        throw new SaikuServiceException(
+                "Datasource descriptors (.sds) and the /datasources tree can only be modified by an administrator");
+    }
+
     public Object saveFile(Object file, String path, String user, String type, List<String> roles)
             throws RepositoryException {
         if (file == null) {
             // Create new folder. saiku#895 fix: the canWrite check below was
             // previously INVERTED (`if (canWrite) throw`), denying writes to
             // any user who actually had permission and permitting everyone
-            // else. Branch is dead code today (no REST caller reaches it
-            // with file == null), but left in place so a future folder-
-            // create caller doesn't trip the latent footgun.
+            // else. saiku#1906 SEC review corrected the record here: this branch
+            // is NOT dead code (an earlier comment claimed no caller reaches it
+            // with file == null) — it's reachable with a caller-controlled `path`,
+            // and the createFolder() call below now guards against a `../`
+            // segment in `path` escaping the datadir.
             String parent;
             if (path.contains(sep)) {
                 parent = path.substring(0, path.lastIndexOf(sep));
@@ -251,6 +514,7 @@ public class FilesystemRepositoryManager implements IRepositoryManager {
             File node = getFolder(parent);
             Acl2 acl2 = new Acl2(node);
             acl2.setAdminRoles(userService.getAdminRoles());
+            acl2.setHomesRoot(homesRoot());
             if (!acl2.canWrite(node, user, roles)) {
                 throw new SaikuServiceException("You don't have permission to write to " + path);
             }
@@ -268,16 +532,33 @@ public class FilesystemRepositoryManager implements IRepositoryManager {
             // and the shared /datasources tree).
             int pos = path.lastIndexOf(sep);
             String filename = "." + sep + path.substring(pos + 1, path.length());
-            File parent = getFolder(path.substring(0, pos));
+            // saiku#1660: a path with no separator (e.g. "welcome.saikudash",
+            // as JAX-RS hands us when the client posts a bare filename) has
+            // pos == -1, so path.substring(0, pos) threw
+            // StringIndexOutOfBoundsException — surfacing as an opaque HTTP 500
+            // on a fresh home. Mirror the folder-create branch above and treat a
+            // separatorless path as living at the repository root, so it resolves
+            // to a real parent folder and the canWrite gate below still runs.
+            String parentPath = pos >= 0 ? path.substring(0, pos) : sep;
+            // saiku#1903: datasource descriptors are admin-only, wherever they land. The
+            // loader lists *.sds recursively across the whole datadir, so a descriptor in a
+            // user's own (writable) home is picked up exactly like one in /datasources.
+            requireAdminForDatasourceDescriptor(path, roles);
+            File parent = getFolder(parentPath);
             // saiku#895: gate the write on canWrite. #940: when OVERWRITING an
             // existing file, check that file's own ACL (which inherits the
             // parent folder when it has no per-file entry) so a per-dashboard
             // edit/PRIVATE setting is honoured; for a NEW file, fall back to
             // the parent folder (you need folder-write to create a child).
             File target = getNode(path);
+            // saiku#1907: remember whether this is a brand-new file BEFORE we write it,
+            // so we only stamp a per-file PRIVATE ACL on creation and never clobber an
+            // existing per-file entry (e.g. a SECURED share the owner set on it).
+            boolean isNewFile = !target.exists();
             File aclNode = target.exists() ? target : parent;
             Acl2 acl2 = new Acl2(aclNode);
             acl2.setAdminRoles(userService.getAdminRoles());
+            acl2.setHomesRoot(homesRoot());
             if (!acl2.canWrite(aclNode, user, roles)) {
                 throw new SaikuServiceException("You don't have permission to write to " + path);
             }
@@ -305,8 +586,70 @@ public class FilesystemRepositoryManager implements IRepositoryManager {
                 log.error("Failed to write file to {}", path, e);
             }
 
+            // saiku#1907: give every newly-created file under a user's home its own
+            // PRIVATE ACL entry (owner = the saver). Without it a home file has no
+            // per-file entry and access rests entirely on the ancestor home folder's
+            // PRIVATE entry resolving by canonical key — which fails on the datadir /
+            // home-path seam, letting the walk-up reach the permissive /homes default.
+            stampPrivateHomeAclIfNeeded(path, resNode, user, isNewFile);
+
             return resNode;
         }
+    }
+
+    /**
+     * saiku#1907: when a brand-new file is saved under a user's home ({@code /homes/...}),
+     * write a PRIVATE {@link AclEntry} (owner = {@code user}) into its parent folder's
+     * {@code acl.json}, keyed by the file's own path. This makes home files self-describing
+     * for {@link Acl2#getMethods}: it finds the file's own PRIVATE entry directly instead of
+     * relying on the ancestor home-folder entry resolving across a datadir/home-path seam.
+     *
+     * <p>Best-effort and non-clobbering: only stamps a genuinely new file, only under
+     * {@code /homes/}, and only when no per-file entry already exists (so a SECURED share the
+     * owner set on the file is preserved). The {@link Acl2} constructor pre-loads the folder's
+     * existing entries, so {@code serialize} merges rather than overwrites siblings.
+     *
+     * <p>saiku#1907 F2: the stamp is applied ONLY when the file's nearest effective ancestor
+     * ACL is PRIVATE or absent — never inside a SECURED/PUBLIC (shared) folder, where a PRIVATE
+     * per-file entry would lock the folder owner and every sharee out of a file saved into a
+     * space they explicitly share. In a shared folder the file correctly inherits the folder ACL.
+     */
+    private void stampPrivateHomeAclIfNeeded(String path, File resNode, String user, boolean isNewFile) {
+        if (!isNewFile || resNode == null || user == null || user.isEmpty() || !isUnderHome(path)) {
+            return;
+        }
+        try {
+            Acl2 acl2 = new Acl2(resNode);
+            if (userService != null) {
+                acl2.setAdminRoles(userService.getAdminRoles());
+                acl2.setHomesRoot(homesRoot());
+            }
+            AclType ancestorType = acl2.nearestAncestorAclType(resNode);
+            boolean privateContext = (ancestorType == null || ancestorType == AclType.PRIVATE);
+            if (privateContext && acl2.getEntry(resNode.getPath()) == null) {
+                acl2.addEntry(resNode.getPath(), new AclEntry(user, AclType.PRIVATE, null, null));
+                acl2.serialize(resNode);
+            }
+        } catch (Exception e) {
+            // Never fail the save because the ACL stamp failed; the getMethods fail-closed
+            // guard (saiku#1907) still protects the file if the entry is absent.
+            log.warn("Could not stamp per-file home ACL for {}", path, e);
+        }
+    }
+
+    /**
+     * Is {@code path} a repository path that lives inside the {@code /homes} tree? Tolerant of
+     * leading separators and Windows back-slashes; used by saiku#1907's per-file home ACL stamp.
+     */
+    static boolean isUnderHome(String path) {
+        if (path == null) {
+            return false;
+        }
+        String p = path.replace('\\', '/');
+        while (p.startsWith("/")) {
+            p = p.substring(1);
+        }
+        return p.equals("homes") || p.startsWith("homes/");
     }
 
     public void removeFile(String path, String user, List<String> roles) throws RepositoryException {
@@ -319,6 +662,7 @@ public class FilesystemRepositoryManager implements IRepositoryManager {
         File node = getFolder(path);
         Acl2 acl2 = new Acl2(node);
         acl2.setAdminRoles(userService.getAdminRoles());
+        acl2.setHomesRoot(homesRoot());
         if (!acl2.canWrite(node, user, roles)) {
             throw new SaikuServiceException("You don't have permission to remove " + path);
         }
@@ -339,22 +683,39 @@ public class FilesystemRepositoryManager implements IRepositoryManager {
         }
         Acl2 srcAcl = new Acl2(src);
         srcAcl.setAdminRoles(userService.getAdminRoles());
+        srcAcl.setHomesRoot(homesRoot());
         if (!srcAcl.canWrite(src, user, roles)) {
             throw new SaikuServiceException("You don't have permission to move " + source);
         }
+        // saiku#1903: a rename into *.sds (or into /datasources) is a descriptor write.
+        requireAdminForDatasourceDescriptor(target, roles);
         File dest = getNode(target);
         if (dest.exists()) {
             throw new RepositoryException("Cannot move: target already exists (" + target + ")");
         }
         File destParent = dest.getParentFile();
-        if (destParent != null && destParent.exists()) {
-            // Writing the node into its new parent requires write on that parent.
-            Acl2 destAcl = new Acl2(destParent);
-            destAcl.setAdminRoles(userService.getAdminRoles());
-            if (!destAcl.canWrite(destParent, user, roles)) {
-                throw new SaikuServiceException("You don't have permission to write to " + target);
-            }
+        // saiku#1907 N1 (#1934): require write permission on the nearest EXISTING ancestor of the
+        // destination BEFORE creating any missing directories. The old code only checked canWrite
+        // when destParent already existed, so a move into a not-yet-existing path (e.g.
+        // /dashboards/<new>/x, /queries/..., /datasources/..., or a brand-new /homes/<name>)
+        // skipped the ACL gate entirely and then mkdirs()'d it. A missing parent is NEVER
+        // permission — resolve to the nearest existing ancestor and gate on that.
+        File writeAnchor = (destParent != null && destParent.exists()) ? destParent : nearestExistingAncestor(dest);
+        // Fail closed if there is no existing ancestor to gate on (unreachable today — dest comes
+        // from resolveWithinDatadir so an ancestor always exists — but never treat "no anchor" as
+        // permission).
+        if (writeAnchor == null) {
+            throw new SaikuServiceException("You don't have permission to write to " + target);
         }
+        Acl2 destAcl = new Acl2(writeAnchor);
+        destAcl.setAdminRoles(userService.getAdminRoles());
+        destAcl.setHomesRoot(homesRoot());
+        if (!destAcl.canWrite(writeAnchor, user, roles)) {
+            throw new SaikuServiceException("You don't have permission to write to " + target);
+        }
+        // saiku#1907 N1: never let a non-admin create a NEW direct child of /homes other than
+        // their own canonical home (defence-in-depth beyond the ancestor gate above).
+        refuseForeignHomeChildCreation(dest, user, roles);
         if (destParent != null && !destParent.exists() && !destParent.mkdirs()) {
             throw new RepositoryException("Cannot move: could not create destination folder for " + target);
         }
@@ -434,8 +795,8 @@ public class FilesystemRepositoryManager implements IRepositoryManager {
         File node = getFolder(s);
         Acl2 acl2 = new Acl2(node);
         acl2.setAdminRoles(userService.getAdminRoles());
+        acl2.setHomesRoot(homesRoot());
         if (!acl2.canRead(node, username, roles)) {
-            // TODO Throw exception
             throw new RepositoryException();
         }
 
@@ -576,6 +937,7 @@ public class FilesystemRepositoryManager implements IRepositoryManager {
         }
         Acl2 acl2 = new Acl2(node);
         acl2.setAdminRoles(userService.getAdminRoles());
+        acl2.setHomesRoot(homesRoot());
         AclEntry entry = node != null ? acl2.getEntry(node.getPath()) : null;
         if (entry == null) entry = new AclEntry();
         return entry;
@@ -590,6 +952,7 @@ public class FilesystemRepositoryManager implements IRepositoryManager {
         }
         Acl2 acl2 = new Acl2(node);
         acl2.setAdminRoles(userService.getAdminRoles());
+        acl2.setHomesRoot(homesRoot());
 
         if (acl2.canGrant(node, username, roles)) {
             return getAclObj(object);
@@ -618,6 +981,7 @@ public class FilesystemRepositoryManager implements IRepositoryManager {
 
         Acl2 acl2 = new Acl2(node);
         acl2.setAdminRoles(userService.getAdminRoles());
+        acl2.setHomesRoot(homesRoot());
 
         if (acl2.canGrant(node, username, roles)) {
             if (node != null) {
@@ -704,7 +1068,21 @@ public class FilesystemRepositoryManager implements IRepositoryManager {
                     log.debug("p split: " + p);
                     String[] t = append.split("/");
 
-                    if (!workspaces && !s[s.length - 2].equals(t[t.length - 1])) {
+                    // saiku#1871: this used to rename every datasource it loaded to
+                    // "<parentDir>_<storedName>". With workspaces off — the only mode OSS runs in —
+                    // that directory is always the default "unknown", so the prefix carried no
+                    // information at all: `foodmart.sds` was surfaced to every user, every URL and
+                    // every MDX unique name as `unknown_foodmart`.
+                    //
+                    // It is off by default now. saiku#1869 first taught datasource lookup to accept
+                    // BOTH spellings, so existing saved queries, dashboards and apps — which bake
+                    // the prefixed name into their connection field and into
+                    // [unknown_foodmart].[FoodMart]... unique names — keep resolving untouched. No
+                    // migration, and anything still asking for the old name simply finds it.
+                    //
+                    // The property restores the old behaviour for anyone whose own tooling matches
+                    // on the prefixed spelling beyond what that alias covers.
+                    if (isWorkspacePrefixEnabled() && !workspaces && !s[s.length - 2].equals(t[t.length - 1])) {
                         d.setName(s[s.length - 2] + "_" + (d != null ? d.getName() : ""));
                     }
                 }
@@ -792,6 +1170,7 @@ public class FilesystemRepositoryManager implements IRepositoryManager {
 
         Acl2 acl = new Acl2(root);
         acl.setAdminRoles(userService.getAdminRoles());
+        acl.setHomesRoot(homesRoot());
 
         for (File file : objects) {
             try {
@@ -807,8 +1186,14 @@ public class FilesystemRepositoryManager implements IRepositoryManager {
 
                     relativePath = relativePath.replace("\\", "/");
 
-                    if (acl.canRead(relativePath, username, roles)) {
-                        List<AclMethod> acls = acl.getMethods(new File(relativePath), username, roles);
+                    // saiku#1907 F6: run the ACL check against the ABSOLUTE on-disk file, not the
+                    // datadir-relative string. new File(relativePath) resolves against the JVM CWD
+                    // (nothing there), so on a case-sensitive FS (Linux/CI) every acl.json read
+                    // missed and getMethods walked up to a null parent -> NONE, making non-admin
+                    // catalogue listings come back EMPTY (admins were masked by the role
+                    // short-circuit). The absolute file finds the real acl.json chain.
+                    if (acl.canRead(file, username, roles)) {
+                        List<AclMethod> acls = acl.getMethods(file, username, roles);
 
                         if (file.isFile()) {
                             if (!fileType.isEmpty()) {
@@ -818,7 +1203,7 @@ public class FilesystemRepositoryManager implements IRepositoryManager {
                                     }
 
                                     String extension = FilenameUtils.getExtension(file.getPath());
-                                    String owner = acl.getOwner(new File(relativePath));
+                                    String owner = acl.getOwner(file);
                                     long modified = file.lastModified();
                                     repoObjects.add(new RepositoryFileObject(
                                             filename,
@@ -888,10 +1273,30 @@ public class FilesystemRepositoryManager implements IRepositoryManager {
      * disk. The new return value is the actual data-dir-relative File so
      * ACLs land where the caller expects (closes the latent bug behind
      * saiku#948).
+     *
+     * <p>saiku#1906 SEC follow-up: this used to build the target via raw string
+     * concatenation ({@code fixPath(getDatadir() + path)}) with no bounds check, so a
+     * {@code ../} segment in {@code path} escaped the datadir. That's reachable with
+     * caller-controlled input via {@link #createUser(String)} (every login / admin
+     * add-user path is {@code "/homes/" + username}) and the {@code saveFile} /
+     * {@code saveInternalFile} null-content branches. Now resolves through the same
+     * {@link #resolveWithinDatadir(String)} guard {@link #createNode(String)} uses,
+     * fail-closed.
      */
     private File createFolder(String path) {
-        String appended = fixPath(getDatadir() + path);
-        File resolved = new File(appended);
+        path = fixPath(path);
+        File resolved;
+        try {
+            resolved = resolveWithinDatadir(path).toFile();
+        } catch (RepositoryException | InvalidPathException e) {
+            // Preserve historical signature (no checked exception) by throwing unchecked.
+            // Path-traversal attempts are programmer / attacker errors, not flow control.
+            // saiku#1906 SEC follow-up (CWE-117): don't echo the raw path into the message --
+            // Paths.get() accepts a newline character on Linux, so a crafted path would be
+            // log-line injection once this surfaces in a REST 500 body or a log.error call
+            // site. The raw value is still available in the cause, for debugging.
+            throw new SaikuServiceException("Path traversal attempt rejected", e);
+        }
         resolved.mkdirs();
         return resolved;
     }
@@ -914,6 +1319,74 @@ public class FilesystemRepositoryManager implements IRepositoryManager {
 
     private File getFolder(String path) throws RepositoryException {
         return this.getNode(path);
+    }
+
+    /**
+     * saiku#1907 F7: the real {@code <datadir>/homes} container for the current context, used to
+     * anchor {@link Acl2}'s home-isolation guard so it can't be impersonated by a nested or
+     * elsewhere-named {@code homes} folder. Best-effort — null on any resolution problem, which
+     * leaves {@link Acl2} on its name-based fallback.
+     */
+    private File homesRoot() {
+        try {
+            return getNode(sep + "homes");
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** The nearest ancestor of {@code f} that exists on disk, or null. saiku#1907 N1. */
+    private static File nearestExistingAncestor(File f) {
+        File p = f == null ? null : f.getParentFile();
+        while (p != null && !p.exists()) {
+            p = p.getParentFile();
+        }
+        return p;
+    }
+
+    /** Does {@code roles} carry an admin role? Mirrors {@link #requireAdminForDatasourceDescriptor}. */
+    private boolean callerIsAdmin(List<String> roles) {
+        List<String> adminRoles = userService != null ? userService.getAdminRoles() : null;
+        if (adminRoles == null || adminRoles.isEmpty()) {
+            adminRoles = java.util.Collections.singletonList("ROLE_ADMIN");
+        }
+        return roles != null && !java.util.Collections.disjoint(roles, adminRoles);
+    }
+
+    /** Best-effort canonical path string (falls back to a normalised absolute path). */
+    private static String canonicalPathString(File f) {
+        try {
+            return f.getCanonicalPath();
+        } catch (Exception e) {
+            return f.getAbsoluteFile().toPath().normalize().toString();
+        }
+    }
+
+    /**
+     * saiku#1907 N1: a non-admin may create a NEW direct child of the {@code /homes} container only
+     * if it is their OWN canonical home. Any missing node on the path to {@code dest} that would be
+     * a direct child of {@code /homes} is refused fail-closed for a foreign name — closing the
+     * moveFile vector that let an attacker plant another user's {@code /homes/<name>}.
+     */
+    private void refuseForeignHomeChildCreation(File dest, String user, List<String> roles) {
+        if (callerIsAdmin(roles)) {
+            return;
+        }
+        File homes = homesRoot();
+        if (homes == null || dest == null) {
+            return;
+        }
+        String homesCanon = canonicalPathString(homes);
+        File cur = dest;
+        while (cur != null && !cur.exists()) {
+            File parent = cur.getParentFile();
+            if (parent != null
+                    && canonicalPathString(parent).equals(homesCanon)
+                    && !Usernames.sameUser(cur.getName(), user)) {
+                throw new SaikuServiceException("Only an administrator or the owner may create a home folder");
+            }
+            cur = parent;
+        }
     }
 
     private File getNode(String path) {
@@ -962,18 +1435,37 @@ public class FilesystemRepositoryManager implements IRepositoryManager {
         return resolved;
     }
 
+    /**
+     * Resolve {@code filename} strictly inside the datadir and return the (not-yet-created)
+     * {@link File} node, via the same {@link #resolveWithinDatadir(String)} guard the read paths
+     * ({@link #getNode(String)}) already use.
+     *
+     * <p>Historically this concatenated the datadir with the caller-supplied path with no bounds
+     * check at all — unlike the read side — so a {@code ../} sequence (including one arriving via
+     * an unsanitised datasource name written straight into {@code <datadir>/datasources/<name>.sds}
+     * or {@code <name>-csv.json}) escaped the repo root on every write funnelled through here:
+     * {@link #saveInternalFile}, {@link #saveBinaryInternalFile}, {@link #saveDataSource}, and the
+     * {@code saveFile} path (closes saiku#1906, CWE-22). Fails closed: a path that normalises
+     * outside the datadir throws unchecked, mirroring {@link #getNode(String)}.
+     */
     private File createNode(String filename) {
         filename = fixPath(filename);
-        File nodeFile = new File(filename);
-
-        if (nodeFile.isAbsolute() && filename.startsWith(this.getDatadir())) { // Check if it's a full path already
-            log.debug("Creating file:" + filename);
-        } else { // If not, prefix it with the datadir
-            log.debug("Creating file:" + this.getDatadir() + filename);
-            nodeFile = new File(this.getDatadir(), filename);
+        try {
+            File nodeFile = resolveWithinDatadir(filename).toFile();
+            log.debug("Creating file:" + nodeFile);
+            return nodeFile;
+        } catch (RepositoryException | InvalidPathException e) {
+            // Preserve historical signature (no checked exception) by throwing unchecked.
+            // Path-traversal attempts are programmer / attacker errors, not flow control.
+            // InvalidPathException (e.g. a NUL byte or a stray ':' on Windows) means
+            // Paths.get() itself rejected the input — fail closed the same way.
+            // saiku#1906 SEC follow-up (CWE-117): don't echo the raw filename into the
+            // message -- Paths.get() accepts a newline character on Linux, so a crafted
+            // path would be log-line injection once this surfaces in a REST 500 body or a
+            // log.error call site. The raw value is still available in the cause, for
+            // debugging.
+            throw new SaikuServiceException("Path traversal attempt rejected", e);
         }
-
-        return nodeFile;
     }
 
     private HttpSession getSession() {

@@ -1,3 +1,7 @@
+/*
+ *   Copyright 2026 Spicule Ltd
+ *   Apache License, Version 2.0.
+ */
 package org.saiku.database.dto;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
@@ -21,6 +25,22 @@ public class SaikuUser {
 
     private String[] roles;
     private int id;
+
+    /**
+     * Account-enabled flag, mirrored from the {@code USERS.ENABLED} column (saiku#1809 PR4). Defaults
+     * to {@code true} — every code path that creates/updates a user writes {@code enabled=true}, so an
+     * account is only ever disabled by a direct edit of the row. Surfacing it lets the scheduler's
+     * owner-identity gate refuse to run a disabled owner's job.
+     */
+    private boolean enabled = true;
+
+    public boolean isEnabled() {
+        return enabled;
+    }
+
+    public void setEnabled(boolean enabled) {
+        this.enabled = enabled;
+    }
 
     public String getUsername() {
         return username;

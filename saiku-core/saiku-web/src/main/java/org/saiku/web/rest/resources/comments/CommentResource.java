@@ -19,6 +19,7 @@ import java.util.Map;
 import org.saiku.service.comments.Comment;
 import org.saiku.service.comments.CommentService;
 import org.saiku.service.user.UserService;
+import org.saiku.service.util.security.Usernames;
 import org.saiku.web.service.SessionService;
 
 /**
@@ -101,7 +102,7 @@ public class CommentResource {
                     .type(MediaType.APPLICATION_JSON)
                     .build();
         }
-        boolean canDelete = (username != null && username.equals(c.author)) || isAdmin(currentRoles());
+        boolean canDelete = Usernames.sameUser(username, c.author) || isAdmin(currentRoles());
         if (!canDelete) {
             return forbidden();
         }
@@ -137,16 +138,10 @@ public class CommentResource {
         return u == null ? null : u.toString();
     }
 
-    @SuppressWarnings("unchecked")
+    // saiku#1752: roles come from the single authoritative SecurityContextHolder reader, not the
+    // lazily-seeded session "roles" map (see SessionRoles / saiku#1747).
     private List<String> currentRoles() {
-        if (sessionService == null) {
-            return List.of();
-        }
-        Object r = sessionService.getAllSessionObjects().get("roles");
-        if (r instanceof List<?>) {
-            return (List<String>) r;
-        }
-        return List.of();
+        return org.saiku.web.rest.util.SessionRoles.currentRoles();
     }
 
     private static Response badRequest(String message) {

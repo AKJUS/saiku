@@ -9,7 +9,7 @@
   chat-log scroll ref + its auto-scroll-to-bottom effect.
 -->
 <script lang="ts">
-	import { Sparkles, AlertTriangle, X, Loader2 } from 'lucide-svelte';
+	import { Sparkles, AlertTriangle, X, Loader2 } from '@lucide/svelte';
 	import type { SchemaCanvasStore } from './state.svelte.js';
 	import type { AnthropicBlock, ChatMessage } from './ai-chat-types';
 
@@ -264,8 +264,7 @@
 						maxlength="2000"
 						disabled={drafting}
 						class="min-h-0 flex-1 resize-none rounded border border-input bg-background px-2 py-1.5 text-xs leading-relaxed placeholder:text-muted-foreground focus:border-ring focus:ring-1 focus:ring-ring focus:outline-none disabled:opacity-60"
-						data-testid="canvas-ai-chat-input"
-					></textarea>
+						data-testid="canvas-ai-chat-input"></textarea>
 					<button
 						type="button"
 						onclick={() => onSend(chatDraft)}

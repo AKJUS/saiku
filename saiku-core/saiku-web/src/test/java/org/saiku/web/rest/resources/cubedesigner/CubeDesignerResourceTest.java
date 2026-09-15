@@ -91,6 +91,13 @@ public class CubeDesignerResourceTest {
         }
 
         @Override
+        public java.util.Map<String, SaikuDatasource> getDatasources(String[] roles) {
+            // Keyed by connection name — mirrors the real manager, so the id fallback
+            // in getDatasourceByIdOrName has to scan the 'id' property to find a match.
+            return ds == null ? java.util.Map.of() : java.util.Map.of(ds.getName(), ds);
+        }
+
+        @Override
         public String getInternalFileData(String path) {
             return repoFiles.get(path);
         }
@@ -115,6 +122,26 @@ public class CubeDesignerResourceTest {
     }
 
     // -- (1) introspect ---------------------------------------------------------
+
+    @Test
+    public void introspect_resolvesByDatasourceId_whenNameLookupMisses() {
+        // saiku#1661: the admin API + cube-designer route pass the UUID id, which getDatasource(name)
+        // never matches — profiling must fall back to the datasource's 'id' property. Datasource is
+        // named "unknown_foodmart" but addressed by its id "uuid-abc".
+        Properties props = new Properties();
+        props.setProperty(ISaikuConnection.URL_KEY, JDBC_URL);
+        props.setProperty(ISaikuConnection.USERNAME_KEY, "sa");
+        props.setProperty(ISaikuConnection.PASSWORD_KEY, "");
+        props.setProperty("id", "uuid-abc");
+        SaikuDatasource named = new SaikuDatasource("unknown_foodmart", SaikuDatasource.Type.OLAP, props);
+        StubDatasourceService svc = new StubDatasourceService("unknown_foodmart", named);
+        CubeDesignerResource byId = new CubeDesignerResource(new DatasourceJdbcConnectionProvider(svc), svc);
+
+        Response r = byId.introspect("uuid-abc");
+        assertEquals(200, r.getStatus());
+        IntrospectResult body = (IntrospectResult) r.getEntity();
+        assertTrue(body.tables().stream().anyMatch(t -> "CUSTOMER".equalsIgnoreCase(t.name())));
+    }
 
     @Test
     public void introspect_returnsSeededTableAndColumns() {
@@ -185,6 +212,39 @@ public class CubeDesignerResourceTest {
         SchemaResult body = (SchemaResult) r.getEntity();
         assertEquals(xml, body.mondrianXml());
         assertEquals(DATA_SOURCE_ID, body.label());
+    }
+
+    @Test
+    public void schema_readsExternalFileCatalog_viaCanonicalFileUri() throws Exception {
+        // saiku#1661: the runtime datasource stores the Catalog as a canonical file URL —
+        // on Windows that's file:///C:/... , whose leading slash before the drive letter made
+        // resolveSchemaXml's Path.of throw InvalidPathException ("Illegal char <:> at index 2")
+        // and 500 the endpoint. Using tmp.toUri() reproduces that exact form on Windows (and the
+        // POSIX file:///home/... form on Linux), so this pins the fix on both platforms.
+        Path tmp = Files.createTempFile("cube-designer-schema-uri", ".xml");
+        tmp.toFile().deleteOnExit();
+        String xml = "<Schema name=\"FoodMart\"/>";
+        Files.writeString(tmp, xml, StandardCharsets.UTF_8);
+        String location =
+                "jdbc:mondrian:Jdbc=" + JDBC_URL + ";MODE=MySQL;Catalog=" + tmp.toUri() + ";JdbcDrivers=org.h2.Driver";
+
+        Response r = resourceFor(location, Map.of()).schema(DATA_SOURCE_ID);
+        assertEquals(200, r.getStatus());
+        assertEquals(xml, ((SchemaResult) r.getEntity()).mondrianXml());
+    }
+
+    @Test
+    public void stripFileScheme_handlesWindowsDriveAndPosixForms() {
+        // Windows drive-letter URIs: the leading slash before the drive must be dropped.
+        assertEquals("C:/Users/x.xml", CubeDesignerResource.stripFileScheme("file:/C:/Users/x.xml"));
+        assertEquals("C:/Users/x.xml", CubeDesignerResource.stripFileScheme("file:///C:/Users/x.xml"));
+        // No leading slash (already a valid Windows path) — untouched.
+        assertEquals("C:\\Users\\x.xml", CubeDesignerResource.stripFileScheme("file:C:\\Users\\x.xml"));
+        // POSIX absolute paths must NOT be altered.
+        assertEquals("/home/user/x.xml", CubeDesignerResource.stripFileScheme("file:/home/user/x.xml"));
+        assertEquals("/home/user/x.xml", CubeDesignerResource.stripFileScheme("file:///home/user/x.xml"));
+        // file://host/share form — authority stripped.
+        assertEquals("/share/x.xml", CubeDesignerResource.stripFileScheme("file://host/share/x.xml"));
     }
 
     @Test

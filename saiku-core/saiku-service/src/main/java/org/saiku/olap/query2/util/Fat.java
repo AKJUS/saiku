@@ -1,3 +1,7 @@
+/*
+ *   Copyright 2026 Spicule Ltd
+ *   Apache License, Version 2.0.
+ */
 package org.saiku.olap.query2.util;
 
 import java.sql.SQLException;
@@ -5,6 +9,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Pattern;
 import mondrian.olap4j.SaikuMondrianHelper;
 import org.apache.commons.lang3.StringUtils;
 import org.olap4j.Axis;
@@ -50,6 +55,16 @@ public class Fat {
 
     private static final Logger log = LoggerFactory.getLogger(Fat.class);
 
+    /**
+     * saiku#1721 — conservative shape a bracketed Measure reference must match before it is
+     * emitted verbatim into a {@code FILTER(...)}: one or more {@code [segment]} tokens joined
+     * by dots, where no segment contains a nested {@code [} or {@code ]}. This admits legitimate
+     * unique names like {@code [Measures].[Store Sales]} while rejecting smuggled MDX such as
+     * {@code [Measures].[Store Sales] > 0 OR [Measures].[Unit Sales]} — anything carrying an
+     * operator, a comparison, or unbalanced/nested brackets outside a segment fails the match.
+     */
+    private static final Pattern BRACKETED_MEASURE_REF = Pattern.compile("^(\\[[^\\[\\]]+\\]\\.)*\\[[^\\[\\]]+\\]$");
+
     public static Query convert(ThinQuery tq, Cube cube) throws SQLException {
 
         Query q = new Query(tq.getName(), cube);
@@ -72,7 +87,8 @@ public class Fat {
     private static void convertCalculatedMembers(Query q, List<ThinCalculatedMember> thinCms) {
         if (thinCms != null && thinCms.size() > 0) {
             for (ThinCalculatedMember qcm : thinCms) {
-                // TODO improve this
+                // Mondrian 3 vs 4 naming: 3.x hierarchy names carry no brackets, so
+                // strip them only on that scheme.
                 String name = qcm.getHierarchyName();
                 boolean mondrian3 = false;
                 if (SaikuMondrianHelper.getMondrianServer(q.getConnection())
@@ -445,7 +461,11 @@ public class Fat {
         }
     }
 
-    private static List<IFilterFunction> convertFilters(Query q, List<ThinFilter> filters) {
+    // Package-visible for the wiring test (saiku#1721): the 17 measurePredicate unit tests all
+    // call the helper directly, so reverting the call site at "case Measure:" back to a drop-stub
+    // keeps them green. This entry point lets a test prove the call site actually wires the
+    // predicate into the filter set.
+    static List<IFilterFunction> convertFilters(Query q, List<ThinFilter> filters) {
         List<IFilterFunction> qfs = new ArrayList<>();
         for (ThinFilter f : filters) {
             switch (f.getFlavour()) {
@@ -485,7 +505,13 @@ public class Fat {
                     }
                     break;
                 case Measure:
-                    // TODO Implement this
+                    // saiku#1717: previously an empty stub — a Measure-flavour filter was
+                    // silently DROPPED and the query ran unconstrained (returning MORE
+                    // data than the client asked to constrain, with no error, no log).
+                    // Semantics: FILTER(set, <measure> <op> <numeric value>), composed
+                    // strictly from the typed parts; malformed input now throws instead
+                    // of silently widening the result.
+                    qfs.add(new GenericFilter(measurePredicate(f)));
                     break;
                 case N:
                     List<String> nexp = f.getExpressions();
@@ -506,6 +532,90 @@ public class Fat {
             }
         }
         return qfs;
+    }
+
+    /**
+     * saiku#1717 — build the MDX predicate for a Measure-flavour filter:
+     * {@code <measureRef> <op> <numericValue>}, e.g. {@code [Measures].[Store Sales] > 100000}.
+     *
+     * <p>Strictly composed from the typed parts (never a raw client expression — that's what
+     * the Generic flavour is for, and it stays as-is):
+     * <ul>
+     *   <li>{@code expressions[0]} — the measure: a bracketed unique name is used verbatim
+     *       ONLY if it matches the conservative {@link #BRACKETED_MEASURE_REF} shape (dotted
+     *       {@code [segment]} tokens with no nested brackets or trailing operators), otherwise
+     *       it is rejected — this is what stops crafted MDX from riding the bracketed branch;
+     *       a bare name is wrapped as {@code [Measures].[name]} with the standard MDX
+     *       {@code ]} → {@code ]]} escape so the bare reference can't be broken out of.</li>
+     *   <li>{@code expressions[1]} — the comparison value: MUST parse as a number; anything
+     *       else is rejected so no free-form MDX can ride in through this typed surface.</li>
+     *   <li>{@code operator} — the comparison; {@code LIKE} has no numeric-MDX meaning and is
+     *       rejected.</li>
+     * </ul>
+     *
+     * Malformed input throws {@link IllegalArgumentException} — the pre-fix behaviour was a
+     * silent drop that WIDENED the result set, which is the worst possible failure mode for
+     * a filter. Package-visible for unit tests.
+     */
+    static String measurePredicate(ThinFilter f) {
+        List<String> mexp = f.getExpressions();
+        if (mexp == null || mexp.size() != 2) {
+            throw new IllegalArgumentException("Measure filter requires exactly 2 expressions [measure, value], got: "
+                    + (mexp == null ? "null" : String.valueOf(mexp.size())));
+        }
+        String measure = mexp.get(0) == null ? "" : mexp.get(0).trim();
+        String value = mexp.get(1) == null ? "" : mexp.get(1).trim();
+        if (measure.isEmpty()) {
+            throw new IllegalArgumentException("Measure filter: measure name/uniqueName is required");
+        }
+        try {
+            Double.parseDouble(value);
+        } catch (NumberFormatException nfe) {
+            throw new IllegalArgumentException(
+                    "Measure filter: comparison value must be numeric, got: '" + value + "'");
+        }
+        if (f.getOperator() == null) {
+            throw new IllegalArgumentException("Measure filter: comparison operator is required");
+        }
+        String op;
+        switch (f.getOperator()) {
+            case EQUALS:
+                op = "=";
+                break;
+            case NOTEQUAL:
+                op = "<>";
+                break;
+            case GREATER:
+                op = ">";
+                break;
+            case GREATER_EQUALS:
+                op = ">=";
+                break;
+            case SMALLER:
+                op = "<";
+                break;
+            case SMALLER_EQUALS:
+                op = "<=";
+                break;
+            default:
+                throw new IllegalArgumentException(
+                        "Measure filter: operator " + f.getOperator() + " is not a numeric comparison");
+        }
+        String measureRef;
+        if (measure.startsWith("[")) {
+            // saiku#1721: a bracketed reference is emitted verbatim into FILTER(...), so it must
+            // match the conservative unique-name shape. Reject anything carrying operators, nested
+            // brackets, or trailing MDX — otherwise a crafted expressions[0] such as
+            // "[Measures].[Store Sales] > 0 OR [Measures].[Unit Sales]" smuggles arbitrary MDX.
+            if (!BRACKETED_MEASURE_REF.matcher(measure).matches()) {
+                throw new IllegalArgumentException(
+                        "Measure filter: bracketed measure reference is not a valid unique name: '" + measure + "'");
+            }
+            measureRef = measure;
+        } else {
+            measureRef = "[Measures].[" + measure.replace("]", "]]") + "]";
+        }
+        return measureRef + " " + op + " " + value;
     }
 
     private static void extendSortableQuerySet(Query q, ISortableQuerySet qs, ThinSortableQuerySet ts) {

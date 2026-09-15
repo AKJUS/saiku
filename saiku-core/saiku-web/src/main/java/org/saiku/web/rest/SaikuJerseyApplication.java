@@ -1,3 +1,7 @@
+/*
+ *   Copyright 2026 Spicule Ltd
+ *   Apache License, Version 2.0.
+ */
 package org.saiku.web.rest;
 
 import jakarta.servlet.ServletContext;
@@ -27,6 +31,14 @@ public class SaikuJerseyApplication extends ResourceConfig {
         // is misconfigured. Without this dynamic feature Jersey silently
         // ignores @RolesAllowed annotations.
         register(RolesAllowedDynamicFeature.class);
+        // saiku#1732: install a deterministic JAX-RS SecurityContext sourced from Spring's
+        // SecurityContextHolder BEFORE RolesAllowedDynamicFeature evaluates (AUTHENTICATION runs
+        // before AUTHORIZATION). Without this, the @RolesAllowed check inherits the servlet
+        // container's SecurityContext, whose Spring-wrapper propagation into Jersey is
+        // non-deterministic — flipping admin requests between 200 and 403 across JVM launches and
+        // resource classes. This makes the role check match the Spring authorities directly; the
+        // Spring URL gate stays the boundary, so non-admin/anon behaviour is unchanged.
+        register(SaikuJaxrsSecurityContextFilter.class);
         // saiku#791: translate Jackson deserialisation failures into the
         // typed AiQueryResponse 400 envelope instead of the raw text/plain
         // Jackson message that leaked class names and source location.

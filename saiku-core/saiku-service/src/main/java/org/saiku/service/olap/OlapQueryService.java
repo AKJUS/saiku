@@ -112,13 +112,17 @@ public class OlapQueryService implements Serializable {
             SaikuCube scube = qd.getFakeCube(xml);
             OlapConnection con = olapDiscoverService.getNativeConnection(scube.getConnection());
             IQuery query = qd.unparse(xml, con);
-            // TODO - this is not good! could lead to duplicate queries
+            // saiku#1713 RESOLVED: last-write-wins IS the contract, on purpose.
+            // This registry is the caller's own session workspace (olapQueryBean is
+            // session-scoped), the REST entry point is POST /saiku/{user}/query/{name}
+            // with create-or-replace semantics (re-opening a saved query re-registers
+            // it under the same name), and session restore (readObject below) replays
+            // every entry through this method - a reject-on-collision would break all
+            // three. Pinned in QueryNameCollisionIT.
             if (name == null) {
                 name = UUID.randomUUID().toString();
-                putIQuery(name, query);
-            } else {
-                putIQuery(name, query);
             }
+            putIQuery(name, query);
             return ObjectUtil.convert(query);
         } catch (Exception e) {
             throw new SaikuServiceException("Error creating query from xml", e);
@@ -209,7 +213,7 @@ public class OlapQueryService implements Serializable {
             CellDataSet result = OlapResultSetUtil.cellSet2Matrix(cellSet, formatter);
             Long format = (new Date()).getTime();
 
-            result.setRuntime(new Double(format - start).intValue());
+            result.setRuntime((int) (format - start)); // saiku#1036: new Double(...) is deprecated-for-removal
             getIQuery(queryName).storeCellset(cellSet);
             getIQuery(queryName).storeFormatter(formatter);
             // we could do a check if query.getTotalFunctions() actually includes a total function and if not dont
@@ -227,7 +231,6 @@ public class OlapQueryService implements Serializable {
                 if (!cellSet.getAxes().get(0).getAxisOrdinal().equals(Axis.ROWS)) {
                     rowsIndex = (rowsIndex + 1) & 1;
                 }
-                // TODO - refactor this using axis ordinals etc.
                 final AxisInfo[] axisInfos = new AxisInfo[] {
                     new AxisInfo(cellSet.getAxes().get(rowsIndex)),
                     new AxisInfo(cellSet.getAxes().get((rowsIndex + 1) & 1))
@@ -338,11 +341,13 @@ public class OlapQueryService implements Serializable {
                             }
                         }
                     }
-                    // TODO: Move it to columns since drilling through with 2 filter items of the same dimension doesn't
-                    // work
-                    //					if (filterDim.getInclusions().size() > 1) {
-                    //						query.moveDimension(filterDim, Axis.COLUMNS);
-                    //					}
+                    // saiku#1714 RESOLVED: the OSBI-era breakage (drillthrough failing when the
+                    // filter axis held two inclusions of the SAME dimension) is fixed upstream in
+                    // the Mondrian fork — compound-slicer DRILLTHROUGH now executes and its totals
+                    // are exact (verified against FoodMart; regression-pinned in DrillthroughIT).
+                    // The never-enabled move-to-columns workaround that sat commented here for a
+                    // decade is gone: moving a multi-member filter dim onto COLUMNS would have
+                    // drilled only the FIRST member's cell, silently dropping the rest.
                 }
             }
         }
@@ -1138,7 +1143,7 @@ public class OlapQueryService implements Serializable {
                 filters = getAxisSelection(queryName, "FILTER");
             }
             if (type.equalsIgnoreCase("xls")) {
-                // TODO - added null parameter for filters - not used anymore
+                // Filters parameter retired - null satisfies the legacy ExcelExporter signature.
                 return ExcelExporter.exportExcel(rs, formatter, null);
             }
             if (type.equalsIgnoreCase("csv")) {

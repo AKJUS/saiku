@@ -1,3 +1,7 @@
+/*
+ *   Copyright 2026 Spicule Ltd
+ *   Apache License, Version 2.0.
+ */
 package org.saiku.datasources.connection.encrypt;
 
 import java.nio.file.Files;
@@ -42,6 +46,15 @@ final class InstallKeyProvider {
     private static volatile SecretKey cachedKey;
 
     private InstallKeyProvider() {}
+
+    /**
+     * Returns the raw per-install key bytes (32 bytes, AES-256). Callers that need to derive a
+     * secondary key (e.g. an HMAC key for unsubscribe-token signing, saiku#1811 PR2) use this rather
+     * than the {@link SecretKey} wrapper. Never log the returned bytes.
+     */
+    static byte[] getKeyBytes() {
+        return getKey().getEncoded();
+    }
 
     /** Returns the per-install AES key, resolving (and persisting, if needed) on first call. */
     static SecretKey getKey() {

@@ -220,6 +220,165 @@
         <property name="mailConfig" ref="mailConfig"/>
     </bean>
 
+    <!-- saiku#943 Phase 0 (mail-setup wizard). Writable, encrypted-at-rest,
+         write-only SMTP config file layer under ${saiku.home}/mail-config.json.
+         The resolver merges it with env/prop config env-wins (env-managed
+         deployments render the wizard read-only). -->
+    <bean id="mailConfigStore" class="org.saiku.service.mail.MailConfigStore">
+        <constructor-arg type="java.nio.file.Path" value="${saiku.home:./saiku-home}"/>
+    </bean>
+    <bean id="mailConfigResolver" class="org.saiku.service.mail.MailConfigResolver">
+        <constructor-arg ref="mailConfigStore"/>
+    </bean>
+
+    <!-- GET/POST /saiku/api/admin/mail-config — admin mail-setup wizard, plus
+         POST /saiku/api/admin/mail-config/test (P0-C): a rate-limited test send
+         to the admin's own configured selfTo ONLY (never a client recipient —
+         anti-relay boundary). Request-scoped + scoped-proxy (reads the request
+         SecurityContext via userService.isAdmin()). Returns MailConfigView only
+         (never the password). The test-send rate limiter and the sender factory
+         default via field-init, so no extra properties are needed here.
+         Auto-registered with Jersey by SaikuJerseyApplication. -->
+    <bean id="mailConfigResource" scope="request" class="org.saiku.web.email.MailConfigResource">
+        <aop:scoped-proxy/>
+        <property name="mailConfigStore" ref="mailConfigStore"/>
+        <property name="mailConfigResolver" ref="mailConfigResolver"/>
+        <property name="userService" ref="userServiceBean"/>
+    </bean>
+
+    <!-- saiku#1811 PR1 (recipient-trust model). Writable, file-backed recipient
+         allowlist under ${saiku.home}/mail-recipients.json (explicit addresses +
+         domain suffixes). DORMANT: no send path consults it in PR1 — it only
+         records the admin's intended allowlist for a future RecipientGate. The
+         anti-relay boundary (recipient is only ever the server's own selfTo) is
+         unchanged. #1811 PR2/PR3: consent + suppression + the gate slot in here. -->
+    <bean id="recipientTrustStore" class="org.saiku.service.mail.trust.RecipientTrustStore">
+        <constructor-arg type="java.nio.file.Path" value="${saiku.home:./saiku-home}"/>
+    </bean>
+
+    <!-- GET/POST /saiku/api/admin/mail-recipients — admin CRUD over the recipient
+         allowlist. Admin-only (class @RolesAllowed + per-method isAdmin(), plus the
+         /rest/saiku/admin/** Spring URL gate). Request-scoped + scoped-proxy (reads
+         the request SecurityContext via userService.isAdmin()). Returns
+         RecipientTrustView only. Auto-registered with Jersey by SaikuJerseyApplication. -->
+    <bean id="recipientTrustResource" scope="request" class="org.saiku.web.email.RecipientTrustResource">
+        <aop:scoped-proxy/>
+        <property name="recipientTrustStore" ref="recipientTrustStore"/>
+        <property name="userService" ref="userServiceBean"/>
+    </bean>
+
+    <!-- saiku#1811 PR2 (suppression + one-click unsubscribe). Writable, file-backed
+         suppression list under ${saiku.home}/mail-suppression.json. FAIL-SAFE: it can
+         only ever REDUCE who may be mailed (the future top-veto for a RecipientGate),
+         never enable a send. No send path consults it yet in PR2. -->
+    <bean id="suppressionStore" class="org.saiku.service.mail.trust.SuppressionStore">
+        <constructor-arg type="java.nio.file.Path" value="${saiku.home:./saiku-home}"/>
+    </bean>
+
+    <!-- HMAC signer/verifier for one-click unsubscribe tokens. No-arg ctor derives the
+         HMAC key from the SAME per-install key that encrypts stored datasource passwords
+         (CryptoUtil.installKeyMaterial()), domain-separated — no new key mechanism. -->
+    <bean id="unsubscribeTokens" class="org.saiku.service.mail.trust.UnsubscribeTokens"/>
+
+    <!-- PUBLIC (permitAll) POST/GET /saiku/mail/unsubscribe. HMAC-token-gated so no
+         third-party unsubscribe forgery; generic 200 for valid/invalid alike (no
+         enumeration oracle); idempotent; rate-limited per client IP; never logs or
+         echoes the address. Only ever ADDS to the suppression store (fail-safe). The
+         permitAll URL rule lives in applicationContext-saiku.xml, scoped to exactly
+         /rest/saiku/mail/unsubscribe. Auto-registered with Jersey. -->
+    <bean id="unsubscribeResource" scope="request" class="org.saiku.web.email.UnsubscribeResource">
+        <aop:scoped-proxy/>
+        <property name="suppressionStore" ref="suppressionStore"/>
+        <property name="unsubscribeTokens" ref="unsubscribeTokens"/>
+    </bean>
+
+    <!-- saiku#1811 PR3 (double-opt-in consent + fail-closed RecipientGate). Writable,
+         file-backed consent store under ${saiku.home}/mail-consent.json. Stores only a
+         SALTED HASH of each consent token (irreversible on disk); a recipient confirms
+         with the raw token delivered to their own mailbox in a LATER PR. DORMANT: no
+         send path consults it; no consent-invite email is sent in this PR. Fail-closed:
+         only a CONFIRMED entry counts as consented. -->
+    <bean id="recipientConsentStore" class="org.saiku.service.mail.trust.RecipientConsentStore">
+        <constructor-arg type="java.nio.file.Path" value="${saiku.home:./saiku-home}"/>
+    </bean>
+
+    <!-- The SINGLE fail-closed chokepoint every future outbound send to a non-self
+         recipient must pass. decide()/clear() consult, in order: NOT suppressed (top
+         veto) -> allowlisted -> consent CONFIRMED. Any failure (incl. a missing/empty
+         store) DENIES. DORMANT: NO send path calls this gate in PR3 — it is
+         decision-only infrastructure for #1811 PR4. Pure: no send, no network. -->
+    <bean id="recipientGate" class="org.saiku.service.mail.trust.RecipientGate">
+        <constructor-arg ref="suppressionStore"/>
+        <constructor-arg ref="recipientTrustStore"/>
+        <constructor-arg ref="recipientConsentStore"/>
+    </bean>
+
+    <!-- PUBLIC (permitAll) GET /saiku/mail/consent/confirm?t=<token>&e=<address>. Flips
+         a PENDING consent record to CONFIRMED via a constant-time salted-hash token
+         match; generic 200 for valid/invalid/expired/unknown alike (no enumeration
+         oracle); idempotent; rate-limited per client IP; never logs or echoes the
+         address. Confirms only — sends nothing. The permitAll URL rule lives in
+         applicationContext-saiku.xml, scoped to exactly /rest/saiku/mail/consent/confirm.
+         Auto-registered with Jersey. -->
+    <bean id="consentConfirmResource" scope="request" class="org.saiku.web.email.ConsentConfirmResource">
+        <aop:scoped-proxy/>
+        <property name="consentStore" ref="recipientConsentStore"/>
+    </bean>
+    <!-- saiku#1811 PR4 (the send gate — consent invite + multi-recipient send). THIS IS
+         THE FIRST CODE THAT CAN MAIL A NON-SELF ADDRESS. Fenced by a default-OFF, ops-only
+         master flag (saiku.mail.sendToOthers.enabled / SAIKU_MAIL_SEND_TO_OTHERS_ENABLED):
+         with the flag OFF (the default) NO path here can mail a non-self address and the
+         app behaves exactly as before — self-send / test-send stay selfTo-only.
+
+         mailSendPolicy: the default-OFF master switch (env/prop only; never settable from
+         HTTP). Every non-self send consults it FIRST and fails closed when off. -->
+    <bean id="mailSendPolicy" class="org.saiku.service.mail.send.MailSendPolicy"/>
+
+    <!-- mailLinkBuilder: builds the absolute per-recipient List-Unsubscribe link and the
+         consent-confirm link from the ops-only public base URL (SAIKU_PUBLIC_BASE_URL /
+         saiku.public.baseUrl). Never from a request, so a client can't point a link at an
+         attacker host. -->
+    <bean id="mailLinkBuilder" class="org.saiku.service.mail.send.MailLinkBuilder"/>
+
+    <!-- multiRecipientMailService: resolves the admin's recipient references, passes them
+         through recipientGate.clear() (not suppressed AND allowlisted AND consent CONFIRMED),
+         and sends ONE individually-addressed message per cleared recipient (never a shared
+         TO/CC/BCC — the recipient list never leaks), each with its own List-Unsubscribe.
+         Per-recipient partial success; rejected recipients silently dropped (logged by count,
+         never address); per-batch cap. Fails closed when the master flag is off. -->
+    <bean id="multiRecipientMailService" class="org.saiku.service.mail.send.MultiRecipientMailService">
+        <constructor-arg ref="mailSendPolicy"/>
+        <constructor-arg ref="recipientGate"/>
+        <constructor-arg ref="unsubscribeTokens"/>
+        <constructor-arg ref="mailLinkBuilder"/>
+    </bean>
+
+    <!-- consentInviteService: the ONE consent-exempt send (the double-opt-in bootstrap).
+         Allowlist-gated, NEVER to a suppressed address, server-constant subject/body, and
+         also behind the master flag. requestConsent() mints the token; one invite carries the
+         confirm link to the allowlisted address only. -->
+    <bean id="consentInviteService" class="org.saiku.service.mail.send.ConsentInviteService">
+        <constructor-arg ref="mailSendPolicy"/>
+        <constructor-arg ref="recipientTrustStore"/>
+        <constructor-arg ref="suppressionStore"/>
+        <constructor-arg ref="recipientConsentStore"/>
+        <constructor-arg ref="mailLinkBuilder"/>
+    </bean>
+
+    <!-- GET /saiku/api/admin/mail-send/status, POST /saiku/api/admin/mail-send/invite,
+         POST /saiku/api/admin/mail-send — admin surface for the send gate. Admin-only
+         (class @RolesAllowed + per-method isAdmin() + the /rest/saiku/admin/** Spring URL
+         gate). Both send endpoints 403 unless the master flag is on. Per-admin rate limits
+         (invite + send) default via field-init. Request-scoped + scoped-proxy (reads the
+         request SecurityContext). Auto-registered with Jersey by SaikuJerseyApplication. -->
+    <bean id="mailSendResource" scope="request" class="org.saiku.web.email.MailSendResource">
+        <aop:scoped-proxy/>
+        <property name="multiRecipientMailService" ref="multiRecipientMailService"/>
+        <property name="consentInviteService" ref="consentInviteService"/>
+        <property name="mailConfigResolver" ref="mailConfigResolver"/>
+        <property name="userService" ref="userServiceBean"/>
+    </bean>
+
     <!-- saiku#1029: demo email gate. fromEnvironment() reads WORKOS_API_KEY +
          WORKOS_CLIENT_ID (both required), SAIKU_DEMO_GATE_TTL_DAYS, and the
          cookie secret (SAIKU_DEMO_GATE_SECRET or an autogenerated, persisted
@@ -235,6 +394,14 @@
     <bean id="infoResource" class="org.saiku.web.rest.resources.InfoResource">
         <property name="platformUtilsService" ref="platformBean"/>
         <property name="demoGate" ref="demoGate"/>
+    </bean>
+
+    <!-- saiku#1868: per-user preferences (/saiku/api/preferences). Gives the UI an account-level
+         place to remember a decision — the onboarding-tour flag was in localStorage, so it replayed
+         on every new browser or device. Singleton is fine: it holds no per-request state, and the
+         caller is resolved from the SecurityContext on each call rather than injected. -->
+    <bean id="userPreferencesResource" class="org.saiku.web.rest.resources.UserPreferencesResource">
+        <property name="datasourceManager" ref="repositoryDsManager"/>
     </bean>
 
     <bean id="asyncQueryServiceBean"
@@ -574,6 +741,8 @@
         <aop:scoped-proxy/>
         <property name="sessionService" ref="sessionService"/>
         <property name="datasourceService" ref="datasourceServiceBean"/>
+        <!-- saiku#1903: admin check for datasource-descriptor (.sds / /datasources) writes. -->
+        <property name="userService" ref="userServiceBean"/>
     </bean>
 
     <!-- Dashboards CRUD (org.saiku.web.rest.resources.dashboards.DashboardResource
@@ -929,6 +1098,168 @@
         <constructor-arg ref="datasourceServiceBean"/>
         <property name="userService" ref="userServiceBean"/>
         <property name="aiService" ref="cubeDesignerAiService"/>
+    </bean>
+
+    <!-- ====================================================================
+         #1809 PR4: periodic-send job scheduler — WIRED LIVE.
+
+         PR2 shipped the engine (JobScheduler) + handler SPI; PR3 added the
+         owner-identity JobRunner (OwnerIdentityJobRunner) that runs a job as its
+         owner via SessionService.runAs, fail-closed on a missing/DISABLED owner.
+         PR4 turns it on: the ticker starts (init-method="start"), an admin CRUD
+         resource is exposed, and the owner enabled-gate is enforced.
+
+         Handlers registered below: the no-op ("NOOP"), and — as of #1098 — the
+         first real handler THRESHOLD_ALERT (measure-crosses-threshold alerting).
+         The threshold-alert handler is scheduler-only: it fires to a
+         SSRF-validated webhook or the server's own self-address, and NEVER uses
+         the send-to-others recipient gate or the renderer. A job whose type has
+         no registered handler is recorded FAILED by the engine (it never
+         throws), so the ticker survives an empty store or an unknown-type job.
+         ==================================================================== -->
+
+    <!-- File-backed job store under ${saiku.home}/jobs (same ctor shape as mailConfigStore). -->
+    <bean id="jobStore" class="org.saiku.service.schedule.JobStore">
+        <constructor-arg type="java.lang.String" value="${saiku.home:./saiku-home}"/>
+    </bean>
+
+    <!-- System UTC clock injected into the engine so time is a seam (tests use a mutable clock). -->
+    <bean id="jobSchedulerClock" class="java.time.Clock" factory-method="systemUTC"/>
+
+    <!-- Resolves a job owner's CURRENT identity fresh from the authoritative UserService: present()
+         means EXISTS *and* ENABLED (USERS.ENABLED), and currentRoles() is re-read live. A
+         missing/disabled owner resolves absent, so the runner refuses to run + the engine auto-disables. -->
+    <bean id="ownerIdentityResolver" class="org.saiku.web.schedule.UserServiceOwnerIdentityResolver">
+        <constructor-arg ref="userServiceBean"/>
+    </bean>
+
+    <!-- The owner-identity JobRunner: runs each job's handler AS the job owner via
+         SessionService.runAs, with exactly the owner's current roles — never the stale snapshot, never
+         an admin/ambient token. Fail-closed on a missing/disabled/owner-less job. -->
+    <bean id="ownerIdentityJobRunner" class="org.saiku.web.schedule.OwnerIdentityJobRunner">
+        <constructor-arg ref="sessionService"/>
+        <constructor-arg ref="ownerIdentityResolver"/>
+    </bean>
+
+    <!-- The no-op handler — sends nothing, touches no external system, always succeeds. -->
+    <bean id="noOpJobHandler" class="org.saiku.service.schedule.NoOpJobHandler"/>
+
+    <!-- ====================================================================
+         #1098: THRESHOLD_ALERT handler — the first REAL JobHandler.
+
+         Evaluates a single measure on the job's cadence and, when it crosses
+         an admin-configured threshold (GT / LT / ABS_CHANGE / PCT_CHANGE),
+         fires an alert. It runs AS the job owner (the owner-identity runner
+         already established the owner's SecurityContext — the handler does NOT
+         re-impersonate), so the measure value honours exactly the owner's RLS.
+
+         *** SCHEDULER-ONLY. *** It NEVER uses the send-to-others recipient gate
+         or the analysis renderer. Alerts go to exactly two places:
+           - a WEBHOOK — an admin-authored, SSRF-validated https URL (no
+             internal / loopback / link-local host; no request-time host from
+             any untrusted source), OR
+           - EMAIL_SELF — the server's OWN configured self-address (the same
+             selfTo the /email/self endpoint uses), never an arbitrary
+             recipient.
+         ==================================================================== -->
+
+    <!-- Reads one measure's current value by reusing the typed AI Query stack
+         (AiCubeMetadataService -> AiSchemaConverter -> ThinQueryService) — no
+         hand-written MDX.
+
+         #1098 fix: the handler runs on a scheduler WORKER thread with NO bound
+         HTTP request, so it must NOT depend on the session-scoped thinQueryBean
+         (its scoped proxy throws "No thread-bound request found" off-request).
+         Instead we inject ThinQueryService's SINGLETON collaborators — the SAME
+         beans the thinQueryBean definition wires (olapDiscoverServiceBean,
+         saikuQueryCacheBean, userServiceBean, queryCoalescerBean,
+         ossieQueryServiceBean) — and the reader builds a fresh ThinQueryService
+         per run. Owner RLS is preserved via SecurityContextHolder (set by the
+         owner-identity runner) + userService, not the bean scope. -->
+    <bean id="aiMeasureValueReader" class="org.saiku.service.schedule.alert.AiMeasureValueReader">
+        <constructor-arg ref="aiCubeMetadataServiceBean"/>
+        <constructor-arg ref="olapDiscoverServiceBean"/>
+        <constructor-arg ref="saikuQueryCacheBean"/>
+        <constructor-arg ref="userServiceBean"/>
+        <constructor-arg ref="queryCoalescerBean"/>
+        <constructor-arg ref="ossieQueryServiceBean"/>
+    </bean>
+
+    <!-- Webhook channel: POSTs a small JSON body via the JDK HttpClient to the
+         admin-authored, SSRF-validated URL. -->
+    <bean id="webhookAlertChannel" class="org.saiku.service.schedule.alert.WebhookAlertChannel"/>
+
+    <!-- Email-to-self channel: reuses the mailSender + mailConfig beans; sends
+         ONLY to mailConfig.selfTo() — never a client / event-supplied recipient. -->
+    <bean id="selfEmailAlertChannel" class="org.saiku.service.schedule.alert.SelfEmailAlertChannel">
+        <constructor-arg ref="mailSender"/>
+        <constructor-arg ref="mailConfig"/>
+    </bean>
+
+    <!-- The THRESHOLD_ALERT handler itself, wired with both channels + the system clock (cooldown). -->
+    <bean id="thresholdAlertJobHandler" class="org.saiku.service.schedule.alert.ThresholdAlertJobHandler">
+        <constructor-arg ref="aiMeasureValueReader"/>
+        <constructor-arg ref="webhookAlertChannel"/>
+        <constructor-arg ref="selfEmailAlertChannel"/>
+    </bean>
+
+    <!-- ====================================================================
+         #943: DASHBOARD_DIGEST handler — the link-based scheduled subscription.
+
+         On its cadence it reads a small set of key measures (reusing the SAME
+         off-request aiMeasureValueReader as the threshold-alert handler — a
+         fresh ThinQueryService per run from singleton collaborators, NEVER the
+         session-scoped thinQueryBean, so it is safe on a scheduler worker
+         thread) and emails an HTML summary table plus a prominent deep link to
+         the LIVE dashboard (built from the ops public base URL via
+         mailLinkBuilder — SSRF-safe, no request-controlled host).
+
+         *** LEAN, LINK-BASED. *** No dashboard renderer, no headless browser,
+         no PDF — the renderer (#1810) is out of scope.
+
+         Delivery honours the send gate: named recipients go ONLY through
+         multiRecipientMailService (default-OFF master flag + RecipientGate:
+         not suppressed AND allowlisted AND consent CONFIRMED); with the flag
+         off (the default) subscriptions to others send NOTHING and the handler
+         falls back to the server's own self-address (mailConfig.selfTo()) via
+         the #1098 self-send pattern, so a self-subscription still works out of
+         the box. It NEVER composes a non-self message that bypasses the gate.
+         ==================================================================== -->
+    <bean id="dashboardDigestJobHandler" class="org.saiku.service.schedule.digest.DashboardDigestJobHandler">
+        <constructor-arg ref="aiMeasureValueReader"/>
+        <constructor-arg ref="multiRecipientMailService"/>
+        <constructor-arg ref="mailSender"/>
+        <constructor-arg ref="mailConfig"/>
+        <constructor-arg ref="mailLinkBuilder"/>
+    </bean>
+
+    <!-- The live engine. init-method="start" starts the ticker at boot; destroy-method="shutdown"
+         stops both the ticker and worker pools cleanly on context close. Registered handlers: the
+         no-op ("NOOP") and the threshold-alert ("THRESHOLD_ALERT", #1098). -->
+    <bean id="jobScheduler" class="org.saiku.service.schedule.JobScheduler"
+          init-method="start" destroy-method="shutdown">
+        <constructor-arg ref="jobStore"/>
+        <constructor-arg ref="jobSchedulerClock"/>
+        <constructor-arg ref="ownerIdentityJobRunner"/>
+        <property name="handlers">
+            <map>
+                <entry key="NOOP" value-ref="noOpJobHandler"/>
+                <entry key="THRESHOLD_ALERT" value-ref="thresholdAlertJobHandler"/>
+                <entry key="DASHBOARD_DIGEST" value-ref="dashboardDigestJobHandler"/>
+            </map>
+        </property>
+    </bean>
+
+    <!-- GET/POST/DELETE /saiku/admin/jobs — admin CRUD + fire-now. Admin-only (class @RolesAllowed +
+         per-method isAdmin(), plus the /rest/saiku/admin/** Spring URL gate). Request-scoped +
+         scoped-proxy (reads the request SecurityContext via userService.isAdmin()/getActiveUsername()).
+         Returns ScheduledJobView only (never the on-disk ScheduledJobFile). Auto-registered with Jersey
+         by SaikuJerseyApplication. -->
+    <bean id="schedulerResource" scope="request" class="org.saiku.web.rest.resources.SchedulerResource">
+        <aop:scoped-proxy/>
+        <property name="jobStore" ref="jobStore"/>
+        <property name="jobScheduler" ref="jobScheduler"/>
+        <property name="userService" ref="userServiceBean"/>
     </bean>
 
 </beans>

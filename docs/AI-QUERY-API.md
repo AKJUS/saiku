@@ -423,6 +423,44 @@ apart (the `format=matrix` bypass was closed in saiku#1324).
   the observed cell **values** are masked. Forecast projections are derived
   aggregates, not raw cells, and are unaffected.
 
+### Unavailable measures: no join path to a filtered dimension (saiku#1780)
+
+A measure can only be evaluated at a grain its measure group actually joins to.
+If you request a measure that has **no join path to a dimension you put on the
+slicer** (a `filters[]` entry) — for example a warehouse-only cost measure
+sliced by a customer geography that its fact table never joins to — Mondrian
+drops that measure from the result entirely. It never becomes a column.
+
+Previously that measure just **vanished**: you asked for N measures and got a
+row with fewer than N keys, silently. Now the server compares what you
+requested against the columns that actually came back and surfaces every
+dropped measure **explicitly**, as a self-describing cell:
+
+```jsonc
+{
+  "data": [
+    {
+      "Product Family": "Drink",
+      "Store Sales":   { "value": 48836.21, "formatted": "48,836.21", "unit": null },
+      "Warehouse Cost": { "value": null, "formatted": null,
+                          "unavailable": "no join path to filtered dimension(s): Customer" }
+    }
+  ]
+}
+```
+
+The cell keeps the normal `{value, formatted, unit}` shape (both `null`) and
+adds an `unavailable` string carrying a machine-readable reason. In `matrix`
+format the dropped measure lands as a trailing indexed column with the same
+`unavailable` cell. `metadata.measures` lists the dropped measure too, so it
+reflects everything you asked for, not just what produced data.
+
+This is **additive and back-compatible**: `unavailable` is only present on the
+dropped cells, so a normal query (nothing dropped) is byte-for-byte unchanged.
+An agent seeing `unavailable` should treat that measure as not answerable at
+the current filter grain — drop the offending filter, or re-issue the measure
+in its own query without that slicer.
+
 ---
 
 ## Step 4 — validation: how the API teaches the agent
@@ -614,10 +652,57 @@ GET /rest/saiku/api/ai/query/{queryId}/drillthrough/columns
 }
 ```
 
-The `name` values are the MDX-qualified labels the downstream `?returns=`
-parameter expects. Use this endpoint to populate a column picker (UI) or
-to know which columns are valid before issuing a constrained drillthrough
-(agents).
+The `name` values are the MDX-qualified labels; `?returns=` accepts these
+verbatim, but agents don't need them — see the two accepted forms below.
+Use this endpoint to populate a column picker (UI) or to know which columns
+are valid before issuing a constrained drillthrough (agents).
+
+**`?returns=` accepts two forms per comma-separated token** (saiku#782):
+
+1. **Bare caption — the recommended agent path.** Exactly the keys a previous
+   drillthrough's row JSON used, so an agent can build a follow-up projection
+   straight from a result it already has, without ever seeing MDX:
+
+   ```http
+   GET /rest/saiku/api/ai/query/{queryId}/drillthrough?returns=Year,Product Family,Store Sales
+   ```
+
+   Bare tokens match case-insensitively against the cube's measure names (+
+   aliases) and every level name (+ aliases) across every hierarchy; the
+   server substitutes the fully-qualified MDX internally.
+
+2. **Fully-qualified MDX — kept for compat** with existing tooling and the
+   `/drillthrough/columns` output. Bracketed tokens pass through verbatim:
+
+   ```http
+   GET /rest/saiku/api/ai/query/{queryId}/drillthrough?returns=[Time].[Time].[Year],[Measures].[Store Sales]
+   ```
+
+Forms may be **mixed per token** in one request — each comma-separated entry
+is resolved independently:
+
+```http
+GET /rest/saiku/api/ai/query/{queryId}/drillthrough?returns=Year,[Measures].[Store Sales]
+```
+
+An unresolvable bare token returns the standard self-correction envelope —
+`status=VALIDATION_ERROR`, `field=returns`, and `available` listing the legal
+candidate set (measure names + level names) so the agent can retry without
+scraping metadata:
+
+```json
+{
+  "status": "VALIDATION_ERROR",
+  "field": "returns",
+  "error": "Unknown returns column 'Yearr'. Use either a bare measure/level caption or a fully-qualified MDX identifier like [Time].[Time].[Year].",
+  "available": ["Year", "Quarter", "Product Family", "Store Sales", "Unit Sales"]
+}
+```
+
+The schema endpoint (`GET /saiku/api/ai/schema/{cube}`) remains the
+source-of-truth for the candidate set — its `measures[].name` and
+`dimensions[].hierarchies[].levels[].name` values are exactly the bare tokens
+`returns=` resolves.
 
 **Two row-bounding options**, with different semantics:
 
@@ -846,6 +931,8 @@ appends these as a dashed continuation with a shaded confidence band.
     }
   ],
   "limit": 0,                                      // Optional. With order > 0 → TopCount/BottomCount; without order → HEAD(rows, N).
+                                                   // A bottom-N (direction "asc" + limit) ranks a set pre-filtered to
+                                                   // NOT ISEMPTY(measure) when nonEmpty is on, so N rows in = N rows out.
   "visualTotals": false,                           // Optional. Wraps rows in VISUALTOTALS().
   "nonEmpty": true                                 // Optional. Default true.
 }

@@ -1,3 +1,7 @@
+/*
+ *   Copyright 2026 Spicule Ltd
+ *   Apache License, Version 2.0.
+ */
 package org.saiku.service.user;
 
 import java.io.Serializable;
@@ -5,14 +9,18 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
-import java.util.Map;
 import org.saiku.database.JdbcUserDAO;
 import org.saiku.database.dto.SaikuUser;
 import org.saiku.service.ISessionService;
 import org.saiku.service.datasource.DatasourceService;
 import org.saiku.service.datasource.IDatasourceManager;
+import org.saiku.service.util.security.Usernames;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.security.authentication.AnonymousAuthenticationToken;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.GrantedAuthority;
+import org.springframework.security.core.context.SecurityContextHolder;
 
 /**
  * Created by bugg on 01/05/14.
@@ -94,6 +102,31 @@ public class UserService implements IUserManager, Serializable {
         return uDAO.findByUserId(id);
     }
 
+    /**
+     * Whether {@code username} names an account that both EXISTS and is ENABLED (saiku#1809 PR4).
+     * Reflects the authoritative {@code USERS.ENABLED} column via {@link #getUsers()}. Fail-closed: an
+     * unknown/blank username, or any lookup error, returns {@code false} — never a best-effort grant.
+     * The scheduler's owner-identity gate calls this so a disabled owner's job never runs.
+     */
+    public boolean isEnabled(String username) {
+        if (username == null || username.isBlank()) {
+            return false;
+        }
+        try {
+            for (SaikuUser u : getUsers()) {
+                // saiku#1907 F4: case-insensitive identity — a job owned by an admin-typed
+                // mixed-case name must still resolve its enabled-state (else the scheduler
+                // fail-closes and auto-disables a legitimately-owned job).
+                if (u != null && Usernames.sameUser(username, u.getUsername())) {
+                    return u.isEnabled();
+                }
+            }
+        } catch (Exception e) {
+            log.warn("Could not resolve enabled-state for user '{}' — treating as disabled (fail-closed)", username);
+        }
+        return false;
+    }
+
     public String[] getRoles(SaikuUser user) {
         return uDAO.getRoles(user);
     }
@@ -126,27 +159,45 @@ public class UserService implements IUserManager, Serializable {
         return user;
     }
 
-    @SuppressWarnings("unchecked")
+    /**
+     * saiku#1732 — read the current user's roles AUTHORITATIVELY from Spring's
+     * {@link SecurityContextHolder}, the deterministic per-request source, NOT from the session map.
+     *
+     * <p>Why this is the right source (and safe): the session {@code "roles"} entry is only ever
+     * written FROM {@code SecurityContextHolder} authorities — {@code SessionService.createSession}
+     * (:149-154) and {@code runAs} (:279/:283) are the only writers, and both copy
+     * {@code getAuthorities()} verbatim. There is no session-only role shape. But the session entry
+     * is populated lazily/conditionally, so under stateless Basic auth it was frequently empty,
+     * making {@code isAdmin()} non-deterministically 403 the admin console (and every role-scoped
+     * read flaky) across JVM launches. Reading the holder directly is superset-or-equal and always
+     * fresh, so this can only make the read MORE accurate — it can never surface a role the
+     * authenticated principal does not hold.
+     *
+     * <p>{@code runAs} impersonation is preserved: it sets {@code SecurityContextHolder} authorities
+     * (and the session) to the same delegated role list for the duration, so the holder read yields
+     * exactly the impersonated roles.
+     *
+     * <p>Fail-closed (saiku#1516): a missing/unauthenticated/anonymous principal yields an EMPTY
+     * list, never null and never a grant — the guard is kept explicit here so the never-grant-on-
+     * absent-auth regression stays locked.
+     */
     private List<String> getCurrentUserRolesList() {
-        // Snapshot the session objects ONCE, then read only from the local.
-        // SessionService.getAllSessionObjects() rebuilds a fresh defensive copy from the
-        // live sessionHolder on every call, and returns an empty map as soon as the
-        // principal's entry is gone (SessionService.java:236-249). Calling it separately
-        // for the guard and for the read was a time-of-check/time-of-use race: the entry
-        // could vanish in between — logout() (:176), runAs()'s finally (:290) and
-        // clearSessions() (:305) all remove it, and sessionHolder is keyed by a principal
-        // whose equals() is username-based, so a second client on the same account is
-        // enough to trigger it. When that happened this method returned null, which made
-        // isAdmin() grant admin and getCurrentUserRoles() throw NPE.
-        Map<String, Object> sessionObjects = sessionService == null ? null : sessionService.getAllSessionObjects();
-        if (sessionObjects != null) {
-            Object roles = sessionObjects.get("roles");
-            if (roles != null) {
-                return (List<String>) roles;
+        Authentication auth = SecurityContextHolder.getContext() == null
+                ? null
+                : SecurityContextHolder.getContext().getAuthentication();
+        // Absent auth, unauthenticated, or an anonymous token -> no roles (fail-closed). An
+        // AnonymousAuthenticationToken carries only ROLE_ANONYMOUS, which is never an admin/schema
+        // role, but we exclude it explicitly so an anonymous principal can never contribute a role.
+        if (auth == null || !auth.isAuthenticated() || auth instanceof AnonymousAuthenticationToken) {
+            return new ArrayList<String>();
+        }
+        List<String> roles = new ArrayList<String>();
+        for (GrantedAuthority ga : auth.getAuthorities()) {
+            if (ga != null && ga.getAuthority() != null) {
+                roles.add(ga.getAuthority());
             }
         }
-
-        return new ArrayList<String>();
+        return roles;
     }
 
     public String[] getCurrentUserRoles() {
@@ -158,11 +209,10 @@ public class UserService implements IUserManager, Serializable {
     public boolean isAdmin() {
         List<String> roles = getCurrentUserRolesList();
 
-        // Absent roles deny. This is an authorization check: the safe direction on
-        // missing input is fail-closed, and the previous default did the opposite —
-        // it granted admin on a null collection. Kept as defence in depth behind the
-        // snapshot in getCurrentUserRolesList(); either layer alone stops the race
-        // above from granting admin, and deny is the correct answer here regardless.
+        // Fail-closed defence in depth (saiku#1516): deny on a null collection. Post-saiku#1732
+        // getCurrentUserRolesList() never returns null (empty list on absent/anonymous auth), so
+        // an absent principal already denies here via the empty-set disjoint below — this guard is
+        // kept explicit so the never-grant-on-null regression stays locked regardless.
         if (roles == null) {
             return false;
         }

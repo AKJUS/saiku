@@ -21,8 +21,10 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Pattern;
 import org.apache.commons.lang3.StringUtils;
 import org.saiku.database.dto.MondrianSchema;
 import org.saiku.datasources.connection.IConnectionManager;
@@ -69,6 +71,29 @@ public class RepositoryDatasourceManager implements IDatasourceManager, Applicat
      * unscoped default.
      */
     private static final String DEFAULT_WORKSPACE = "unknown";
+
+    /**
+     * Allowlist for datasource names (saiku#1906, CWE-22): the connection name flows straight
+     * into filesystem paths — {@code <datadir>/datasources/<name>.sds} and, for CSV datasources,
+     * {@code <name>-csv.json} — with no sanitisation, so a name carrying {@code ../} segments (or
+     * a Windows drive letter / UNC / ADS colon) can escape the datadir entirely. Must start with
+     * a Unicode letter or digit, then Unicode letters/digits plus space / dot / underscore /
+     * parens / hyphen, max 128 chars.
+     *
+     * <p>saiku#1906 SEC follow-up: the original ASCII-only {@code [A-Za-z0-9 ._-]} rejected real,
+     * already-stored datasource names on re-save (admin update, cube-designer save-and-attach) —
+     * accented/international names and parenthesised names especially. Widened to Unicode letters
+     * and digits ({@code \p{L}}/{@code \p{N}}, which are Unicode-aware by definition — no
+     * {@code UNICODE_CHARACTER_CLASS} flag needed) plus parens. Still an allowlist: every
+     * path/URL/JSON metacharacter ({@code / \ : * ? " < > |}), control chars, {@code '}, and
+     * {@code & # , @ ; =} stay excluded — the name also flows into a
+     * {@code mondrian://…/<name>.xml} URL and a quoted CSV JSON, so punctuation stays
+     * conservative; this only widens enough to stop breaking real names. Deliberately ALLOWS
+     * internal spaces: existing datasource names may already contain them, so this is a
+     * path-safety filter, not a strict identifier rule.
+     */
+    private static final Pattern DATASOURCE_NAME_PATTERN =
+            Pattern.compile("^[\\p{L}\\p{N}][\\p{L}\\p{N} ._()-]{0,127}$");
 
     public IConnectionManager connectionManager;
     private ScopedRepo sessionRegistry;
@@ -124,6 +149,16 @@ public class RepositoryDatasourceManager implements IDatasourceManager, Applicat
         } catch (RepositoryException e) {
             log.error("Could not start repo", e);
         }
+
+        // saiku#1844: teach Mondrian to read schemas out of THIS repository. Every data source
+        // the admin UI writes carries Catalog=mondrian://<schema> (see DataSourceMapper), a
+        // scheme Mondrian's stock file handler has never been able to resolve — so the cube
+        // never loaded. Installed after irm.start() so the reader is usable the moment
+        // loadDatasources() below triggers the first connection.
+        SaikuVirtualFileHandler.install(this::readRepositoryFileQuietly);
+        // saiku#1845: and confine file: catalogs to the Saiku data directories, so a data source
+        // can't be pointed at an arbitrary host file.
+        SaikuVirtualFileHandler.setFileGuard(SchemaFileAccessGuard.fromEnvironment(datadir));
 
         // Load the datasources
         loadDatasources(ext);
@@ -203,6 +238,18 @@ public class RepositoryDatasourceManager implements IDatasourceManager, Applicat
 
     public SaikuDatasource addDatasource(SaikuDatasource datasource) throws Exception {
         DataSource ds = new DataSource(datasource);
+        // saiku#1906: defence-in-depth behind FilesystemRepositoryManager's own path-traversal
+        // guard — reject the name here, at the one chokepoint every write below (csv json,
+        // workspace mondrian catalog path, and the final .sds descriptor) keys off.
+        validateDatasourceName(ds.getName());
+
+        // saiku#1864: the load path decorates every name as `<workspace>_<storedName>`
+        // (FilesystemRepositoryManager.getAllDataSources). Nothing undid that here, so a client
+        // that read a datasource, changed a field and wrote it back saved `unknown_foo.sds`
+        // ALONGSIDE the original `foo.sds` — a duplicate sharing the same id, with the original
+        // name still serving the old catalog. Strip the decoration so read-modify-write lands on
+        // the datasource it came from.
+        ds.setName(DatasourceNameDecoration.undecorate(ds.getName(), currentWorkspaceKey()));
 
         if (ds.getCsv() != null && ds.getCsv().equals("true")) {
             String split[] = ds.getLocation().split("=");
@@ -271,14 +318,15 @@ public class RepositoryDatasourceManager implements IDatasourceManager, Applicat
 
             irm.saveDataSource(ds, separator + "datasources" + separator + ds.getName() + ".sds", "fixme");
 
-            String name = ds.getName();
+            // Cache under the decorated name — the key a reload would produce (saiku#1864).
+            String name = decoratedName(ds.getName());
 
             // Adding the connection before refreshing it
             // Preserve the incoming type (OLAP/OSSIE) rather than hard-coding OLAP — Ossie
             // datasources need their type carried through so the connection factory picks the
             // right ISaikuConnection subclass.
             SaikuDatasource sds = new SaikuDatasource(name, datasource.getType(), datasource.getProperties());
-            datasourcesForCurrentWorkspace().put(ds.getName(), sds);
+            datasourcesForCurrentWorkspace().put(name, sds);
 
             // In a workspace environment it is necessary to prefix the datasource name with the workspace name
             connectionManager.refreshConnection(name);
@@ -286,7 +334,10 @@ public class RepositoryDatasourceManager implements IDatasourceManager, Applicat
             irm.saveDataSource(ds, separator + "datasources" + separator + ds.getName() + ".sds", "fixme");
         }
 
-        String name = ds.getName();
+        // The FILE is stored undecorated (see the strip at the top of this method), but the cache
+        // has to be keyed the way a reload would key it — decorated — or every lookup between now
+        // and the next restart misses (saiku#1864).
+        String name = decoratedName(ds.getName());
         SaikuDatasource sds = new SaikuDatasource(name, SaikuDatasource.Type.OLAP, datasource.getProperties());
 
         // Cache per-workspace — see datasourcesForCurrentWorkspace() for the
@@ -294,6 +345,45 @@ public class RepositoryDatasourceManager implements IDatasourceManager, Applicat
         datasourcesForCurrentWorkspace().put(name, sds);
 
         return datasource;
+    }
+
+    /**
+     * Reject any datasource name that could escape the datadir once concatenated into a file path
+     * (see {@link #DATASOURCE_NAME_PATTERN}), or that could silently fail to persist because the
+     * resulting filename is too long for the underlying filesystem. Fail-closed: null,
+     * non-matching, or over-length names are all rejected.
+     *
+     * <p>saiku#1906 SEC follow-up (data loss): {@link #DATASOURCE_NAME_PATTERN} caps at 128
+     * Unicode code points, but {@code saveDataSource} writes the name as UTF-8 bytes in a
+     * filename — 128 CJK/astral characters can already be 380+ UTF-8 bytes, past ext4's
+     * 255-byte {@code NAME_MAX} once the {@code -csv.json} suffix or a workspace prefix is
+     * added. {@code saveDataSource} swallows the resulting IOException, so without this check a
+     * REST caller would see 200 OK while the datasource silently vanishes on the next restart.
+     * 200 bytes leaves headroom for both.
+     *
+     * <p>saiku#1906 SEC follow-up (CWE-117): the rejection message deliberately does NOT echo the
+     * raw name. This exception's message ends up in a REST 500 body and in {@code log.error} call
+     * sites downstream, and the whole point of this check is that the name isn't trusted yet — an
+     * attacker-supplied name containing a newline would otherwise be log-line injection.
+     */
+    private static void validateDatasourceName(String name) {
+        if (name == null
+                || !DATASOURCE_NAME_PATTERN.matcher(name).matches()
+                || name.getBytes(StandardCharsets.UTF_8).length > 200) {
+            throw new IllegalArgumentException("Illegal datasource name");
+        }
+    }
+
+    /**
+     * The name a stored datasource is surfaced under, i.e. what {@code getAllDataSources} will call
+     * it after the next load. Keep this the inverse of {@link DatasourceNameDecoration#undecorate}.
+     */
+    private String decoratedName(String storedName) {
+        String workspace = currentWorkspaceKey();
+        if (storedName == null || workspace == null || workspace.isEmpty()) {
+            return storedName;
+        }
+        return storedName.startsWith(workspace + "_") ? storedName : workspace + "_" + storedName;
     }
 
     public SaikuDatasource setDatasource(SaikuDatasource datasource) throws Exception {
@@ -305,11 +395,17 @@ public class RepositoryDatasourceManager implements IDatasourceManager, Applicat
             DataSource ds = new DataSource(datasource);
 
             try {
+                // saiku#1906: same allowlist chokepoint as addDatasource() — this bulk path
+                // built the .sds file path off the name with no validation at all. The
+                // FilesystemRepositoryManager-side createNode() backstop only protects the
+                // filesystem impl; a non-filesystem IRepositoryManager (e.g. Saiku Cloud's
+                // Postgres-backed store) wouldn't get it, so validate here too.
+                validateDatasourceName(ds.getName());
                 irm.saveDataSource(ds, separator + "datasources" + separator + ds.getName() + ".sds", "fixme");
                 datasourcesForCurrentWorkspace().put(datasource.getName(), datasource);
 
-            } catch (RepositoryException e) {
-                log.error("Could not add data source" + datasource.getName(), e);
+            } catch (IllegalArgumentException | RepositoryException e) {
+                log.error("Could not add data source: {}", datasource.getName(), e);
             }
         }
         return dsources;
@@ -365,7 +461,43 @@ public class RepositoryDatasourceManager implements IDatasourceManager, Applicat
     }
 
     public SaikuDatasource getDatasource(String datasourceName) {
-        return datasourcesForCurrentWorkspace().get(datasourceName);
+        return lookup(datasourcesForCurrentWorkspace(), datasourceName);
+    }
+
+    /**
+     * Resolve a datasource by name, accepting it with OR without the workspace decoration.
+     *
+     * <p>saiku#1869: every datasource is surfaced as {@code <workspace>_<storedName>} — in
+     * single-tenant OSS that is always {@code unknown_}, a multi-tenant artefact carrying no
+     * information. It is baked into saved queries, dashboards and apps, both as the connection name
+     * and inside MDX unique names ({@code [unknown_foodmart].[FoodMart]...}), so it cannot simply be
+     * dropped without breaking every existing install.
+     *
+     * <p>Accepting both spellings here is step one, and it is deliberately harmless on its own:
+     * nothing is renamed yet, so this only widens what already resolves. It is what lets the
+     * decoration be switched off later without a migration — old content keeps resolving through
+     * the alias, and if some path is missed it degrades to a lookup that still works rather than a
+     * connection that cannot be found.
+     *
+     * <p>Every by-name path funnels through here ({@code getConnection}, {@code getOlapConnection},
+     * {@code refreshConnection}, discover, query), which is why the alias lives at this one point
+     * rather than at each caller.
+     */
+    private SaikuDatasource lookup(Map<String, SaikuDatasource> pool, String datasourceName) {
+        if (pool == null || datasourceName == null) {
+            return null;
+        }
+        SaikuDatasource exact = pool.get(datasourceName);
+        if (exact != null) {
+            return exact;
+        }
+        String workspace = currentWorkspaceKey();
+        // Asked for "foodmart" but stored/keyed as "unknown_foodmart", or vice versa.
+        SaikuDatasource decorated = pool.get(DatasourceNameDecoration.decorate(datasourceName, workspace));
+        if (decorated != null) {
+            return decorated;
+        }
+        return pool.get(DatasourceNameDecoration.undecorate(datasourceName, workspace));
     }
 
     @Override
@@ -373,7 +505,7 @@ public class RepositoryDatasourceManager implements IDatasourceManager, Applicat
         Map<String, SaikuDatasource> current = datasourcesForCurrentWorkspace();
         if (!refresh) {
             if (current.size() > 0) {
-                return current.get(datasourceName);
+                return lookup(current, datasourceName);
             }
         } else {
             return getDatasource(datasourceName);
@@ -415,6 +547,24 @@ public class RepositoryDatasourceManager implements IDatasourceManager, Applicat
     public String getInternalFileData(String file) throws RepositoryException {
 
         return irm.getInternalFile(file);
+    }
+
+    /**
+     * Repository read that reports "absent" instead of throwing — the shape
+     * {@link SaikuVirtualFileHandler} needs.
+     *
+     * <p>saiku#1844. A miss here is ordinary: {@link MondrianCatalogResolver} probes more than one
+     * candidate path per catalog and expects null for the ones that don't exist. Mondrian is
+     * mid-connection when this runs, and a thrown {@link RepositoryException} would surface as an
+     * opaque schema-load failure rather than the resolver simply trying its next candidate.
+     */
+    private String readRepositoryFileQuietly(String path) {
+        try {
+            return irm.getInternalFile(path);
+        } catch (RepositoryException e) {
+            log.debug("No repository file at {}", path, e);
+            return null;
+        }
     }
 
     public InputStream getBinaryInternalFileData(String file) throws RepositoryException {
