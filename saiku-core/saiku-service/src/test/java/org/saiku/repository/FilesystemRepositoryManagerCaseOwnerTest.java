@@ -50,6 +50,23 @@ public class FilesystemRepositoryManagerCaseOwnerTest {
     private FilesystemRepositoryManager manager;
     private File datadir;
 
+    /**
+     * Skip unless the filesystem under test actually distinguishes {@code Admin} from
+     * {@code admin}.
+     *
+     * <p>This used to test {@code os.name} for "win", which is the wrong proxy: macOS runs on a
+     * case-INSENSITIVE APFS/HFS+ volume by default while reporting "Mac OS X", so the guard never
+     * fired and these tests failed on every Mac. CI is Linux, so it never saw it. Probe the real
+     * filesystem instead of inferring it from the OS name.
+     */
+    private void assumeCaseSensitiveFilesystem() {
+        File probe = new File(datadir, "CaseProbe");
+        assertTrue(probe.mkdirs());
+        boolean caseSensitive = !new File(datadir, "caseprobe").exists();
+        assertTrue(probe.delete());
+        org.junit.Assume.assumeTrue("requires a case-sensitive filesystem", caseSensitive);
+    }
+
     private static final List<String> ROLES_USER = Collections.singletonList("ROLE_USER");
     private static final List<String> ROLES_ADMIN = Arrays.asList("ROLE_USER", "ROLE_ADMIN");
 
@@ -133,13 +150,9 @@ public class FilesystemRepositoryManagerCaseOwnerTest {
      */
     @Test
     public void createUser_reuses_and_renames_case_variant_home_to_canonical() throws Exception {
-        // Two case-variant home dirs can only coexist on a case-sensitive filesystem; on
-        // Windows /homes/admin and /homes/Admin are the same directory (rename is a no-op).
-        org.junit.Assume.assumeFalse(
-                "requires a case-sensitive filesystem",
-                System.getProperty("os.name", "")
-                        .toLowerCase(java.util.Locale.ROOT)
-                        .contains("win"));
+        // Two case-variant home dirs can only coexist on a case-sensitive filesystem; where
+        // /homes/admin and /homes/Admin are the same directory the rename is a no-op.
+        assumeCaseSensitiveFilesystem();
         File variant = new File(datadir, "unknown/homes/Admin");
         assertTrue(variant.mkdirs());
         writeFolderAclJson(variant, "PRIVATE", "Admin");
@@ -258,11 +271,7 @@ public class FilesystemRepositoryManagerCaseOwnerTest {
      */
     @Test
     public void nested_subfolder_share_survives_rename_to_canonical() throws Exception {
-        org.junit.Assume.assumeFalse(
-                "requires a case-sensitive filesystem",
-                System.getProperty("os.name", "")
-                        .toLowerCase(java.util.Locale.ROOT)
-                        .contains("win"));
+        assumeCaseSensitiveFilesystem();
 
         File variant = new File(datadir, "unknown/homes/Admin");
         assertTrue(variant.mkdirs());
