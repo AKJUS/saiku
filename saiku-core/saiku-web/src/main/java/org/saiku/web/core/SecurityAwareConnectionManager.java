@@ -32,6 +32,8 @@ import org.saiku.olap.util.exception.SaikuOlapException;
 import org.saiku.service.ISessionService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.security.authentication.AnonymousAuthenticationToken;
+import org.springframework.security.core.Authentication;
 import org.springframework.security.core.GrantedAuthority;
 import org.springframework.security.core.context.SecurityContextHolder;
 
@@ -91,14 +93,7 @@ public class SecurityAwareConnectionManager extends AbstractConnectionManager im
             datasource = handlePassThrough(datasource);
         }
 
-        String newName = name;
-        if (isDatasourceSecurityEnabled(datasource) && sessionService != null) {
-            Map<String, Object> session = sessionService.getAllSessionObjects();
-            String username = (String) session.get("username");
-            if (username != null) {
-                newName = name + "-" + username;
-            }
-        }
+        String newName = resolveConnectionKey(name, datasource);
 
         if (!connections.containsKey(newName)) {
             con = connect(name, datasource);
@@ -122,14 +117,7 @@ public class SecurityAwareConnectionManager extends AbstractConnectionManager im
     @Override
     protected ISaikuConnection refreshInternalConnection(String name, SaikuDatasource datasource) {
         try {
-            String newName = name;
-            if (isDatasourceSecurityEnabled(datasource) && sessionService != null) {
-                Map<String, Object> session = sessionService.getAllSessionObjects();
-                String username = (String) session.get("username");
-                if (username != null) {
-                    newName = name + "-" + username;
-                }
-            }
+            String newName = resolveConnectionKey(name, datasource);
 
             ISaikuConnection con = connections.remove(newName);
             if (con != null) {
@@ -140,6 +128,65 @@ public class SecurityAwareConnectionManager extends AbstractConnectionManager im
             log.error("Error refreshing connection: " + name, e);
         }
         return null;
+    }
+
+    /**
+     * Compute the cache key under which a security-enabled datasource's connection is stored, so
+     * that a per-user connection (and therefore a per-user Mondrian role, applied by {@link
+     * #applySecurity}) is isolated to that user.
+     *
+     * <p>saiku#1948 (F1, CWE-863) — the shared-connection role race. The historical rule keyed the
+     * connection {@code name + "-" + username} ONLY when the session map carries a {@code
+     * "username"}, and that entry is populated exclusively by the UI {@code /session} login. A pure
+     * XMLA client (HTTP Basic against the stateless {@code /xmla/**} chain, no UI login) has no such
+     * session entry, so every authenticated XMLA caller collapsed onto the SAME bare-{@code name}
+     * cached connection. {@code applySecurity} then mutates that one shared connection's role on
+     * every request, and Mondrian reads the role live during query evaluation — so a concurrent
+     * request could flip another user's in-flight XMLA query to a different role scope (an admin
+     * request widening a non-admin's still-running query to root), for the whole query duration.
+     *
+     * <p>Fix: when there is no session {@code "username"} but there IS a fully-authenticated,
+     * non-anonymous principal, key per that principal instead. Each XMLA user then gets their own
+     * cached connection and their own {@code setRoleName}, and the race is gone.
+     *
+     * <p>The REST path is unchanged: a UI session always carries {@code "username"}, so it takes the
+     * first branch exactly as before. The principal fallback only engages for a security-enabled
+     * datasource reached without a session username (i.e. the XMLA/Basic case). A security-DISABLED
+     * datasource still resolves to the bare {@code name} for everyone — {@code applySecurity} never
+     * sets a role there, so there is nothing to isolate.
+     *
+     * <p>Package-private so the reversion guard can assert the keying directly.
+     */
+    String resolveConnectionKey(String name, SaikuDatasource datasource) {
+        if (isDatasourceSecurityEnabled(datasource) && sessionService != null) {
+            Map<String, Object> session = sessionService.getAllSessionObjects();
+            String username = session == null ? null : (String) session.get("username");
+            if (username != null) {
+                return name + "-" + username;
+            }
+            String principal = currentPrincipalName();
+            if (principal != null) {
+                return name + "-" + principal;
+            }
+        }
+        return name;
+    }
+
+    /**
+     * The name of the current fully-authenticated, non-anonymous principal from the {@link
+     * SecurityContextHolder}, or {@code null} if there is none. Mirrors the null-guarding style of
+     * {@link #getSpringRoles()}.
+     */
+    private String currentPrincipalName() {
+        if (SecurityContextHolder.getContext() == null) {
+            return null;
+        }
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        if (auth == null || !auth.isAuthenticated() || auth instanceof AnonymousAuthenticationToken) {
+            return null;
+        }
+        String principalName = auth.getName();
+        return (principalName != null && !principalName.isEmpty()) ? principalName : null;
     }
 
     private SaikuDatasource handlePassThrough(SaikuDatasource datasource) {
