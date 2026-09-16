@@ -14,12 +14,16 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.After;
 import org.junit.Test;
 import org.olap4j.CellSet;
 import org.saiku.olap.query2.ThinQuery;
 import org.saiku.service.olap.ThinQueryService;
 import org.saiku.service.util.QueryContext;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.authority.AuthorityUtils;
+import org.springframework.security.core.context.SecurityContextHolder;
 
 /**
  * Unit tests for {@link AsyncQueryService}. Drives a synthetic {@link ThinQueryService}
@@ -34,6 +38,32 @@ public class AsyncQueryServiceTest {
         if (svc != null) {
             svc.shutdown();
         }
+        SecurityContextHolder.clearContext();
+    }
+
+    /**
+     * saiku#1968 (CWE-863) WIRING test: {@code submit()} must propagate the caller's Spring
+     * SecurityContext to the executor worker. The worker runs on a pooled thread with no security
+     * context of its own; before the fix {@code SecurityContextHolder.getContext()} was empty there,
+     * so {@code SecurityAwareConnectionManager.applySecurity()} resolved to no role -> Mondrian root
+     * (full access) for any async caller, AND the role-aware cellset cache keyed a root result under
+     * an empty-role key. This asserts the actual submit() call site (not a helper): seed a principal
+     * on THIS thread, submit, and confirm the worker body observed that same principal.
+     */
+    @Test
+    public void submit_propagatesSecurityContextToWorker() throws Exception {
+        SecurityContextHolder.getContext()
+                .setAuthentication(new UsernamePasswordAuthenticationToken(
+                        "alice", "n/a", AuthorityUtils.createAuthorityList("ROLE_USER")));
+
+        StubThinQueryService stub = new StubThinQueryService();
+        svc = new AsyncQueryService();
+        svc.setThinQueryService(stub);
+
+        AsyncQueryHandle h = svc.submit(named("q-secctx"));
+        awaitStatus(h, AsyncQueryHandle.Status.DONE, 2000);
+
+        assertEquals("worker must see the submitting thread's principal", "alice", stub.seenPrincipal.get());
     }
 
     @Test(expected = IllegalStateException.class)
@@ -434,6 +464,7 @@ public class AsyncQueryServiceTest {
     private static final class StubThinQueryService extends ThinQueryService {
         final AtomicInteger executeCount = new AtomicInteger();
         final AtomicInteger cancelCount = new AtomicInteger();
+        final AtomicReference<String> seenPrincipal = new AtomicReference<>();
         volatile RuntimeException failure;
         volatile SQLException cancelFailure;
         volatile CellSet resultCellSet;
@@ -441,6 +472,10 @@ public class AsyncQueryServiceTest {
 
         @Override
         public org.saiku.olap.dto.resultset.CellDataSet execute(ThinQuery tq) {
+            // saiku#1968: capture the principal visible on the worker thread at execute() time.
+            org.springframework.security.core.Authentication auth =
+                    SecurityContextHolder.getContext().getAuthentication();
+            seenPrincipal.set(auth == null ? null : auth.getName());
             executeCount.incrementAndGet();
             if (block != null) {
                 try {

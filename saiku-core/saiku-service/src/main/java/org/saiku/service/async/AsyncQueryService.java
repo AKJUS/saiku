@@ -27,6 +27,8 @@ import org.saiku.olap.query2.ThinQuery;
 import org.saiku.service.olap.ThinQueryService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.security.core.context.SecurityContext;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.context.request.RequestAttributes;
 import org.springframework.web.context.request.RequestContextHolder;
 
@@ -135,6 +137,18 @@ public class AsyncQueryService {
         final AsyncQueryHandle handle = new AsyncQueryHandle(id, query, currentPrincipal());
         handles.put(id, handle);
 
+        // saiku#1968 (CWE-863): capture the caller's Spring SecurityContext on THIS (request)
+        // thread and re-establish it on the worker. The executor thread has no security context of
+        // its own, so without this getSpringRoles() would be empty on the worker and
+        // SecurityAwareConnectionManager.applySecurity() would resolve to no role → Mondrian root
+        // (full access) for any async caller. Propagating it also fixes ThinQueryService's
+        // role-aware cellset cache key, which otherwise caches a root result under an empty-role
+        // key. The pool reuses threads, so we clear the context in a finally to prevent it leaking
+        // into the next task. (SecurityContextHolder default mode is thread-local, not inheritable,
+        // and pooled threads defeat inheritable-thread-local anyway, so a manual capture/set/clear
+        // is required — there is no DelegatingSecurityContextExecutor in the wiring.)
+        final SecurityContext capturedSecurityContext = SecurityContextHolder.getContext();
+
         final CompletableFuture<CellSet> fut;
         try {
             fut = CompletableFuture.supplyAsync(
@@ -143,6 +157,7 @@ public class AsyncQueryService {
                         if (requestAttributes != null) {
                             RequestContextHolder.setRequestAttributes(requestAttributes, true);
                         }
+                        SecurityContextHolder.setContext(capturedSecurityContext);
                         try {
                             handle.compareAndSetStatus(
                                     AsyncQueryHandle.Status.PENDING, AsyncQueryHandle.Status.RUNNING);
@@ -151,6 +166,7 @@ public class AsyncQueryService {
                             // per-query context keyed by the query name; fetch it.
                             return thinQueryService.getContext(query.getName()).getOlapResult();
                         } finally {
+                            SecurityContextHolder.clearContext();
                             if (requestAttributes != null) {
                                 if (previous != null) {
                                     RequestContextHolder.setRequestAttributes(previous);

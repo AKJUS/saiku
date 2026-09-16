@@ -27,10 +27,13 @@ import org.olap4j.OlapConnection;
 import org.saiku.datasources.connection.ISaikuConnection;
 import org.saiku.datasources.datasource.SaikuDatasource;
 import org.saiku.service.user.UserService;
-import org.saiku.service.util.exception.SaikuServiceException;
+import org.saiku.service.util.exception.SaikuAccessDeniedException;
+import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.web.context.request.RequestContextHolder;
+import org.springframework.web.context.request.ServletRequestAttributes;
 
 /**
  * saiku#1968 (CWE-863) reversion guard for {@link SecurityAwareConnectionManager#applySecurity}'s
@@ -43,7 +46,7 @@ import org.springframework.security.core.context.SecurityContextHolder;
  * full access to every cube and cell. There was no admin distinction, so an authenticated
  * low-privilege user whose roles resolved to nothing read ALL data.
  *
- * <p>The fix DENIES that case for a non-admin (throws {@link SaikuServiceException}) while keeping
+ * <p>The fix DENIES that case for a non-admin (throws {@link SaikuAccessDeniedException}) while keeping
  * the two working cases intact: a configured admin still gets full access (root role,
  * {@code setRoleName(null)}), and a non-admin WITH a matching/mapped role is still scoped to it.
  *
@@ -66,6 +69,7 @@ public class SecurityAwareConnectionManagerFailClosedTest {
     @After
     public void tearDown() {
         SecurityContextHolder.clearContext();
+        RequestContextHolder.resetRequestAttributes();
     }
 
     // ---- one2one / spring2mondrian --------------------------------------------------------------
@@ -80,7 +84,7 @@ public class SecurityAwareConnectionManagerFailClosedTest {
         try {
             mgr.applySecurity(con.saiku, spring2mondrian());
             fail("expected fail-closed deny for a non-admin that resolves to no Mondrian role");
-        } catch (SaikuServiceException expected) {
+        } catch (SaikuAccessDeniedException expected) {
             // fail-closed: access denied
         }
         assertFalse("deny must NOT set any role (never setRoleName(null)=root)", con.roleWasSet.get());
@@ -128,7 +132,7 @@ public class SecurityAwareConnectionManagerFailClosedTest {
         try {
             mgr.applySecurity(con.saiku, ds);
             fail("expected fail-closed deny for a non-admin whose roles map to no Mondrian role");
-        } catch (SaikuServiceException expected) {
+        } catch (SaikuAccessDeniedException expected) {
             // fail-closed: access denied
         }
         assertFalse(con.roleWasSet.get());
@@ -177,22 +181,52 @@ public class SecurityAwareConnectionManagerFailClosedTest {
         try {
             mgr.applySecurity(con.saiku, spring2mondrian());
             fail("with no admin-role source, admin cannot be proven -> must fail closed (deny)");
-        } catch (SaikuServiceException expected) {
+        } catch (SaikuAccessDeniedException expected) {
             // fail-closed on ambiguity
         }
         assertFalse(con.roleWasSet.get());
     }
 
-    /** No authenticated principal (start-up / warm-up) -> guard does not throw (prior behaviour). */
+    /**
+     * saiku#1968 F1-hardening: a LIVE request (HTTP request attributes present) that reaches the
+     * guard with NO principal must FAIL CLOSED — not fall through to Mondrian root. This is the
+     * shape the async-worker exploit had before SecurityContext propagation landed (no principal on
+     * the worker), and any future context-loss bug. INVERTED from the old
+     * {@code noPrincipal_notDenied} test, which pinned the fall-open behaviour.
+     */
     @Test
-    public void spring2mondrian_noPrincipal_notDenied() {
-        // SecurityContext cleared by @Before -> no authenticated principal.
+    public void spring2mondrian_requestInFlightNoPrincipal_denied() {
+        // No authentication (cleared by @Before) but a request IS in flight.
+        RequestContextHolder.setRequestAttributes(new ServletRequestAttributes(new MockHttpServletRequest()));
+        try {
+            RoleCapturingConnection con = olapConnection("SALES");
+            SecurityAwareConnectionManager mgr = manager();
+            try {
+                mgr.applySecurity(con.saiku, spring2mondrian());
+                fail("a live request with no principal must fail closed, not get Mondrian root");
+            } catch (SaikuAccessDeniedException expected) {
+                // fail-closed
+            }
+            assertFalse(con.roleWasSet.get());
+        } finally {
+            RequestContextHolder.resetRequestAttributes();
+        }
+    }
+
+    /**
+     * Genuine start-up / connection warm-up: no principal AND no HTTP request in flight -> the
+     * guard does NOT throw (nothing is served, and the per-request applySecurity enforces when a
+     * real caller arrives). Preserves start-up; the narrow exemption only fires here.
+     */
+    @Test
+    public void spring2mondrian_noPrincipalNoRequest_notDenied() {
+        RequestContextHolder.resetRequestAttributes(); // ensure truly context-free
         RoleCapturingConnection con = olapConnection("SALES");
         SecurityAwareConnectionManager mgr = manager();
 
         ISaikuConnection result = mgr.applySecurity(con.saiku, spring2mondrian());
 
-        assertEquals("no user in context -> preserve prior (non-serving) behaviour", con.saiku, result);
+        assertEquals("context-free start-up -> preserve prior (non-serving) behaviour", con.saiku, result);
     }
 
     // ---- helpers --------------------------------------------------------------------------------

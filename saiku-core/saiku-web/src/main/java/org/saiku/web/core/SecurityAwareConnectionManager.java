@@ -31,13 +31,14 @@ import org.saiku.datasources.datasource.SaikuDatasource;
 import org.saiku.olap.util.exception.SaikuOlapException;
 import org.saiku.service.ISessionService;
 import org.saiku.service.user.UserService;
-import org.saiku.service.util.exception.SaikuServiceException;
+import org.saiku.service.util.exception.SaikuAccessDeniedException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.security.authentication.AnonymousAuthenticationToken;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.GrantedAuthority;
 import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.web.context.request.RequestContextHolder;
 
 public class SecurityAwareConnectionManager extends AbstractConnectionManager implements Serializable {
 
@@ -300,28 +301,33 @@ public class SecurityAwareConnectionManager extends AbstractConnectionManager im
      * null, or a null/empty list) or the admin check throws, the caller is treated as NON-admin and
      * denied — never defaulted to full.
      *
-     * <p>The guard engages only for a real, authenticated, non-anonymous principal. With no
-     * authenticated principal (server start-up / background connection warm-up) no data is being
-     * served to anyone, and the cached connection's role is re-applied by {@code applySecurity} on
-     * every subsequent request, so the prior behaviour is preserved there rather than breaking
-     * start-up. Anonymous access is already blocked upstream (saiku#1905).
+     * <p>The exemption for "no authenticated principal" is deliberately NARROW: it applies ONLY when
+     * there is also no HTTP request in flight ({@link RequestContextHolder#getRequestAttributes()}
+     * is {@code null}) — i.e. genuine server start-up / background connection warm-up, where no data
+     * is being served to anyone and the cached connection's role is re-applied on every subsequent
+     * request. A LIVE request that reaches here with no principal (e.g. the async worker before
+     * saiku#1968's SecurityContext propagation, or any future context-loss bug) FAILS CLOSED rather
+     * than falling through to Mondrian root. Anonymous access is already blocked upstream
+     * (saiku#1905).
      */
     private void enforceRoleResolvedOrAdmin(SaikuDatasource datasource) {
         String principal = currentPrincipalName();
         if (principal == null) {
-            // No authenticated user in context (start-up / warm-up); nothing is served here.
-            return;
-        }
-        if (isCurrentUserAdmin()) {
+            // No authenticated principal. Exempt ONLY the genuinely context-free case (start-up /
+            // warm-up, no request in flight); a live request without a principal fails closed.
+            if (RequestContextHolder.getRequestAttributes() == null) {
+                return;
+            }
+        } else if (isCurrentUserAdmin()) {
             return; // configured admin keeps full access (Mondrian root role)
         }
         String ds = datasource == null ? "?" : datasource.getName();
         log.warn(
-                "saiku#1968: denying connection on security-enabled datasource \"{}\" — authenticated "
-                        + "non-admin principal \"{}\" resolved to no Mondrian role (fail-closed).",
+                "saiku#1968: denying connection on security-enabled datasource \"{}\" — caller "
+                        + "(principal \"{}\") resolved to no Mondrian role and is not an admin (fail-closed).",
                 ds,
                 principal);
-        throw new SaikuServiceException(
+        throw new SaikuAccessDeniedException(
                 "Access denied: your account is not granted any role on datasource \"" + ds + "\".");
     }
 
