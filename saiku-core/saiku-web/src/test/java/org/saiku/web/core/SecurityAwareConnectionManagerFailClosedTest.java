@@ -1,0 +1,331 @@
+/*
+ *   Copyright 2026 Spicule Ltd
+ *   Apache License, Version 2.0.
+ */
+package org.saiku.web.core;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
+
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
+import java.sql.Connection;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Properties;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import org.junit.After;
+import org.junit.Before;
+import org.junit.Test;
+import org.olap4j.OlapConnection;
+import org.saiku.datasources.connection.ISaikuConnection;
+import org.saiku.datasources.datasource.SaikuDatasource;
+import org.saiku.service.user.UserService;
+import org.saiku.service.util.exception.SaikuServiceException;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.context.SecurityContextHolder;
+
+/**
+ * saiku#1968 (CWE-863) reversion guard for {@link SecurityAwareConnectionManager#applySecurity}'s
+ * fail-open no-Mondrian-role case.
+ *
+ * <p>Before the fix, in BOTH security modes ({@code one2one}/spring2mondrian and
+ * {@code lookup}/springlookupmondrian) a caller whose Spring authorities intersected NO cube role
+ * (or mapped to no Mondrian role) left {@code roleName == null}; {@code setRole(con, null, ...)}
+ * then called {@code OlapConnection.setRoleName(null)}, which is Mondrian's <em>root</em> role —
+ * full access to every cube and cell. There was no admin distinction, so an authenticated
+ * low-privilege user whose roles resolved to nothing read ALL data.
+ *
+ * <p>The fix DENIES that case for a non-admin (throws {@link SaikuServiceException}) while keeping
+ * the two working cases intact: a configured admin still gets full access (root role,
+ * {@code setRoleName(null)}), and a non-admin WITH a matching/mapped role is still scoped to it.
+ *
+ * <p>These tests drive the real {@link SecurityAwareConnectionManager#applySecurity} with a hand
+ * fake {@link ISaikuConnection}/{@link OlapConnection} (a JDK dynamic proxy — no Mockito) and a
+ * seeded {@link SecurityContextHolder} + a real {@link UserService} carrying the configured admin
+ * roles. Reverting the fix flips the two {@code denied_*} tests from green to red (pre-fix they
+ * would resolve to {@code setRoleName(null)} and return the connection instead of throwing).
+ */
+public class SecurityAwareConnectionManagerFailClosedTest {
+
+    private static final String DS = "foodmart";
+    private static final String ADMIN_ROLE = "ROLE_ADMIN";
+
+    @Before
+    public void clearContext() {
+        SecurityContextHolder.clearContext();
+    }
+
+    @After
+    public void tearDown() {
+        SecurityContextHolder.clearContext();
+    }
+
+    // ---- one2one / spring2mondrian --------------------------------------------------------------
+
+    /** Non-admin, no Spring authority intersects the cube's roles -> DENIED (was: full/root). */
+    @Test
+    public void spring2mondrian_nonAdmin_noMatchingRole_denied() {
+        authenticateAs("bob", "ROLE_USER");
+        RoleCapturingConnection con = olapConnection("SALES"); // cube offers SALES; bob has ROLE_USER
+        SecurityAwareConnectionManager mgr = manager();
+
+        try {
+            mgr.applySecurity(con.saiku, spring2mondrian());
+            fail("expected fail-closed deny for a non-admin that resolves to no Mondrian role");
+        } catch (SaikuServiceException expected) {
+            // fail-closed: access denied
+        }
+        assertFalse("deny must NOT set any role (never setRoleName(null)=root)", con.roleWasSet.get());
+    }
+
+    /** Admin, no matching role -> FULL (setRoleName(null)) — the critical no-regression case. */
+    @Test
+    public void spring2mondrian_admin_noMatchingRole_getsFull() {
+        authenticateAs("root", ADMIN_ROLE);
+        RoleCapturingConnection con = olapConnection("SALES"); // admin's authority doesn't name a role
+        SecurityAwareConnectionManager mgr = manager();
+
+        ISaikuConnection result = mgr.applySecurity(con.saiku, spring2mondrian());
+
+        assertEquals("admin keeps the same cached connection", con.saiku, result);
+        assertTrue("admin should have had a role applied", con.roleWasSet.get());
+        assertNull("admin -> Mondrian root role (full access)", con.role.get());
+    }
+
+    /** Non-admin WITH a matching cube role -> scoped exactly as before (unchanged). */
+    @Test
+    public void spring2mondrian_nonAdmin_matchingRole_scoped() {
+        authenticateAs("bob", "ROLE_USER");
+        RoleCapturingConnection con = olapConnection("ROLE_USER", "SALES"); // ROLE_USER matches
+        SecurityAwareConnectionManager mgr = manager();
+
+        ISaikuConnection result = mgr.applySecurity(con.saiku, spring2mondrian());
+
+        assertEquals(con.saiku, result);
+        assertTrue(con.roleWasSet.get());
+        assertEquals("non-admin scoped to the matched Mondrian role", "ROLE_USER", con.role.get());
+    }
+
+    // ---- lookup / springlookupmondrian ----------------------------------------------------------
+
+    /** Non-admin, no authority maps to a Mondrian role -> DENIED (was: full/root). */
+    @Test
+    public void springlookup_nonAdmin_noMapping_denied() {
+        authenticateAs("bob", "ROLE_USER");
+        RoleCapturingConnection con = olapConnection("salesrole");
+        SecurityAwareConnectionManager mgr = manager();
+        // Mapping only covers ROLE_ADMIN; bob's ROLE_USER maps to nothing.
+        SaikuDatasource ds = springlookup("ROLE_ADMIN=salesrole");
+
+        try {
+            mgr.applySecurity(con.saiku, ds);
+            fail("expected fail-closed deny for a non-admin whose roles map to no Mondrian role");
+        } catch (SaikuServiceException expected) {
+            // fail-closed: access denied
+        }
+        assertFalse(con.roleWasSet.get());
+    }
+
+    /** Admin, no mapping -> FULL (setRoleName(null)) — no-regression for the lookup mode too. */
+    @Test
+    public void springlookup_admin_noMapping_getsFull() {
+        authenticateAs("root", ADMIN_ROLE);
+        RoleCapturingConnection con = olapConnection("salesrole");
+        SecurityAwareConnectionManager mgr = manager();
+        // Deliberately no mapping entry for ROLE_ADMIN, so the admin resolves to no role.
+        SaikuDatasource ds = springlookup("ROLE_USER=salesrole");
+
+        ISaikuConnection result = mgr.applySecurity(con.saiku, ds);
+
+        assertEquals(con.saiku, result);
+        assertTrue(con.roleWasSet.get());
+        assertNull("admin -> Mondrian root role (full access)", con.role.get());
+    }
+
+    /** Non-admin WITH a mapped Mondrian role -> scoped exactly as before (unchanged). */
+    @Test
+    public void springlookup_nonAdmin_mappedRole_scoped() {
+        authenticateAs("bob", "ROLE_USER");
+        RoleCapturingConnection con = olapConnection("salesrole");
+        SecurityAwareConnectionManager mgr = manager();
+        SaikuDatasource ds = springlookup("ROLE_USER=salesrole");
+
+        ISaikuConnection result = mgr.applySecurity(con.saiku, ds);
+
+        assertEquals(con.saiku, result);
+        assertTrue(con.roleWasSet.get());
+        assertEquals("non-admin scoped to the mapped Mondrian role", "salesrole", con.role.get());
+    }
+
+    // ---- fail-closed-on-ambiguity ---------------------------------------------------------------
+
+    /** No UserService injected -> admin cannot be proven -> DENY (never default-to-full). */
+    @Test
+    public void spring2mondrian_noUserService_treatedAsNonAdmin_denied() {
+        authenticateAs("root", ADMIN_ROLE); // would be admin IF admin roles were resolvable
+        RoleCapturingConnection con = olapConnection("SALES");
+        SecurityAwareConnectionManager mgr = new SecurityAwareConnectionManager(); // no userService
+
+        try {
+            mgr.applySecurity(con.saiku, spring2mondrian());
+            fail("with no admin-role source, admin cannot be proven -> must fail closed (deny)");
+        } catch (SaikuServiceException expected) {
+            // fail-closed on ambiguity
+        }
+        assertFalse(con.roleWasSet.get());
+    }
+
+    /** No authenticated principal (start-up / warm-up) -> guard does not throw (prior behaviour). */
+    @Test
+    public void spring2mondrian_noPrincipal_notDenied() {
+        // SecurityContext cleared by @Before -> no authenticated principal.
+        RoleCapturingConnection con = olapConnection("SALES");
+        SecurityAwareConnectionManager mgr = manager();
+
+        ISaikuConnection result = mgr.applySecurity(con.saiku, spring2mondrian());
+
+        assertEquals("no user in context -> preserve prior (non-serving) behaviour", con.saiku, result);
+    }
+
+    // ---- helpers --------------------------------------------------------------------------------
+
+    private static SecurityAwareConnectionManager manager() {
+        SecurityAwareConnectionManager mgr = new SecurityAwareConnectionManager();
+        UserService us = new UserService();
+        us.setAdminRoles(Collections.singletonList(ADMIN_ROLE));
+        mgr.setUserService(us);
+        return mgr;
+    }
+
+    private static void authenticateAs(String user, String... authorities) {
+        List<SimpleGrantedAuthority> auths =
+                Arrays.stream(authorities).map(SimpleGrantedAuthority::new).toList();
+        SecurityContextHolder.getContext()
+                .setAuthentication(new UsernamePasswordAuthenticationToken(user, "n/a", auths));
+    }
+
+    private static SaikuDatasource spring2mondrian() {
+        Properties props = new Properties();
+        props.setProperty(ISaikuConnection.SECURITY_ENABLED_KEY, "true");
+        props.setProperty(ISaikuConnection.SECURITY_TYPE_KEY, ISaikuConnection.SECURITY_TYPE_SPRING2MONDRIAN_VALUE);
+        return new SaikuDatasource(DS, SaikuDatasource.Type.OLAP, props);
+    }
+
+    private static SaikuDatasource springlookup(String mapping) {
+        Properties props = new Properties();
+        props.setProperty(ISaikuConnection.SECURITY_ENABLED_KEY, "true");
+        props.setProperty(
+                ISaikuConnection.SECURITY_TYPE_KEY, ISaikuConnection.SECURITY_TYPE_SPRINGLOOKUPMONDRIAN_VALUE);
+        props.setProperty(ISaikuConnection.SECURITY_LOOKUP_KEY, mapping);
+        return new SaikuDatasource(DS, SaikuDatasource.Type.OLAP, props);
+    }
+
+    private static RoleCapturingConnection olapConnection(String... availableRoles) {
+        return new RoleCapturingConnection(Arrays.asList(availableRoles));
+    }
+
+    /**
+     * Hand fake pairing an {@link ISaikuConnection} with a JDK-proxy {@link OlapConnection} that
+     * records {@code setRoleName(...)} and answers {@code getAvailableRoleNames()}. No Mockito.
+     */
+    private static final class RoleCapturingConnection {
+        final AtomicReference<String> role = new AtomicReference<>();
+        final AtomicBoolean roleWasSet = new AtomicBoolean(false);
+        final OlapConnection olap;
+        final ISaikuConnection saiku;
+
+        RoleCapturingConnection(List<String> availableRoles) {
+            this.olap = (OlapConnection) Proxy.newProxyInstance(
+                    getClass().getClassLoader(),
+                    new Class<?>[] {OlapConnection.class},
+                    new OlapHandler(availableRoles));
+            this.saiku = (ISaikuConnection) Proxy.newProxyInstance(
+                    getClass().getClassLoader(), new Class<?>[] {ISaikuConnection.class}, new SaikuHandler());
+        }
+
+        /** Handles the only two OlapConnection methods applySecurity/setRole touch. */
+        private final class OlapHandler implements InvocationHandler {
+            private final List<String> availableRoles;
+
+            OlapHandler(List<String> availableRoles) {
+                this.availableRoles = availableRoles;
+            }
+
+            @Override
+            public Object invoke(Object proxy, Method method, Object[] args) {
+                switch (method.getName()) {
+                    case "getAvailableRoleNames":
+                        return availableRoles;
+                    case "setRoleName":
+                        roleWasSet.set(true);
+                        role.set(args == null ? null : (String) args[0]);
+                        return null;
+                    case "isWrapperFor":
+                        return false; // not a RolapConnection -> setRole takes the setRoleName branch
+                    case "toString":
+                        return "FakeOlapConnection";
+                    case "hashCode":
+                        return System.identityHashCode(proxy);
+                    case "equals":
+                        return proxy == (args == null ? null : args[0]);
+                    default:
+                        return defaultValue(method.getReturnType());
+                }
+            }
+        }
+
+        /** Handles the ISaikuConnection methods getConnectionRoles/setRole read. */
+        private final class SaikuHandler implements InvocationHandler {
+            @Override
+            public Object invoke(Object proxy, Method method, Object[] args) {
+                switch (method.getName()) {
+                    case "getDatasourceType":
+                        return ISaikuConnection.OLAP_DATASOURCE;
+                    case "getConnection":
+                        return olap;
+                    case "getName":
+                        return DS;
+                    case "toString":
+                        return "FakeSaikuConnection";
+                    case "hashCode":
+                        return System.identityHashCode(proxy);
+                    case "equals":
+                        return proxy == (args == null ? null : args[0]);
+                    default:
+                        return defaultValue(method.getReturnType());
+                }
+            }
+        }
+    }
+
+    private static Object defaultValue(Class<?> type) {
+        if (!type.isPrimitive()) {
+            return null;
+        }
+        if (type == boolean.class) {
+            return false;
+        }
+        if (type == void.class) {
+            return null;
+        }
+        if (type == char.class) {
+            return '\0';
+        }
+        return 0;
+    }
+
+    /** Guards that the fake OlapConnection is really an OlapConnection (proxy instanceof). */
+    @Test
+    public void fake_isOlapConnection() {
+        Connection c = olapConnection("SALES").olap;
+        assertTrue(c instanceof OlapConnection);
+    }
+}

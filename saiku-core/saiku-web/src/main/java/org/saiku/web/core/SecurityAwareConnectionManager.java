@@ -30,6 +30,8 @@ import org.saiku.datasources.connection.SaikuConnectionFactory;
 import org.saiku.datasources.datasource.SaikuDatasource;
 import org.saiku.olap.util.exception.SaikuOlapException;
 import org.saiku.service.ISessionService;
+import org.saiku.service.user.UserService;
+import org.saiku.service.util.exception.SaikuServiceException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.security.authentication.AnonymousAuthenticationToken;
@@ -214,7 +216,13 @@ public class SecurityAwareConnectionManager extends AbstractConnectionManager im
         return null;
     }
 
-    private ISaikuConnection applySecurity(ISaikuConnection con, SaikuDatasource datasource) {
+    /**
+     * Applies the caller's Mondrian role to a security-enabled datasource's connection.
+     *
+     * <p>Package-private so the saiku#1968 reversion guard can drive the fail-closed no-match branch
+     * directly (mirrors {@link #resolveConnectionKey}).
+     */
+    ISaikuConnection applySecurity(ISaikuConnection con, SaikuDatasource datasource) {
         if (con == null) {
             throw new IllegalArgumentException("Cannot apply Security to NULL connection object");
         }
@@ -232,6 +240,12 @@ public class SecurityAwareConnectionManager extends AbstractConnectionManager im
                         roleName += "," + sprRole;
                     }
                 }
+            }
+
+            if (roleName == null) {
+                // saiku#1968 (CWE-863): no Spring authority intersected the cube's roles. Deny a
+                // non-admin instead of falling through to setRoleName(null) = Mondrian root.
+                enforceRoleResolvedOrAdmin(datasource);
             }
 
             if (setRole(con, roleName, datasource)) {
@@ -254,12 +268,88 @@ public class SecurityAwareConnectionManager extends AbstractConnectionManager im
                     }
                 }
             }
+
+            if (roleName == null) {
+                // saiku#1968 (CWE-863): no authority mapped to a Mondrian role. Deny a non-admin
+                // instead of falling through to setRoleName(null) = Mondrian root.
+                enforceRoleResolvedOrAdmin(datasource);
+            }
+
             if (setRole(con, roleName, datasource)) {
                 return con;
             }
         }
 
         return con;
+    }
+
+    /**
+     * saiku#1968 (CWE-863) — fail-closed guard for the no-Mondrian-role case.
+     *
+     * <p>On a security-enabled datasource {@link #applySecurity} resolves the caller's Spring
+     * authorities to a Mondrian role; if NOTHING resolves, {@code roleName} is left {@code null} and
+     * {@code setRoleName(null)} would hand the caller Mondrian's <em>root</em> role — full access to
+     * every cube and cell. Historically that fell OPEN for every authenticated user, so a
+     * low-privilege user whose roles mapped to nothing could read all data (REST and XMLA).
+     *
+     * <p>We now permit the null role (full access) ONLY for a configured admin, determined from the
+     * deployment's admin-role list ({@link UserService#getAdminRoles()}) — never a hardcoded role
+     * name. Any other authenticated caller is DENIED with an access-denied exception.
+     *
+     * <p><b>Fail-closed on ambiguity:</b> if the admin roles are unavailable ({@code userService}
+     * null, or a null/empty list) or the admin check throws, the caller is treated as NON-admin and
+     * denied — never defaulted to full.
+     *
+     * <p>The guard engages only for a real, authenticated, non-anonymous principal. With no
+     * authenticated principal (server start-up / background connection warm-up) no data is being
+     * served to anyone, and the cached connection's role is re-applied by {@code applySecurity} on
+     * every subsequent request, so the prior behaviour is preserved there rather than breaking
+     * start-up. Anonymous access is already blocked upstream (saiku#1905).
+     */
+    private void enforceRoleResolvedOrAdmin(SaikuDatasource datasource) {
+        String principal = currentPrincipalName();
+        if (principal == null) {
+            // No authenticated user in context (start-up / warm-up); nothing is served here.
+            return;
+        }
+        if (isCurrentUserAdmin()) {
+            return; // configured admin keeps full access (Mondrian root role)
+        }
+        String ds = datasource == null ? "?" : datasource.getName();
+        log.warn(
+                "saiku#1968: denying connection on security-enabled datasource \"{}\" — authenticated "
+                        + "non-admin principal \"{}\" resolved to no Mondrian role (fail-closed).",
+                ds,
+                principal);
+        throw new SaikuServiceException(
+                "Access denied: your account is not granted any role on datasource \"" + ds + "\".");
+    }
+
+    /**
+     * Whether the current caller is a configured admin — i.e. one of their Spring authorities is
+     * named in {@link UserService#getAdminRoles()}. Fail-closed: any missing dependency or error
+     * yields {@code false} (treat as non-admin), never a default-true.
+     */
+    private boolean isCurrentUserAdmin() {
+        try {
+            UserService us = getUserService();
+            if (us == null) {
+                return false;
+            }
+            List<String> adminRoles = us.getAdminRoles();
+            if (adminRoles == null || adminRoles.isEmpty()) {
+                return false;
+            }
+            for (String sprRole : getSpringRoles()) {
+                if (adminRoles.contains(sprRole)) {
+                    return true;
+                }
+            }
+            return false;
+        } catch (Exception e) {
+            log.warn("saiku#1968: admin-role resolution failed; treating caller as non-admin (deny).", e);
+            return false;
+        }
     }
 
     private boolean setRole(ISaikuConnection con, String roleName, SaikuDatasource datasource) {
