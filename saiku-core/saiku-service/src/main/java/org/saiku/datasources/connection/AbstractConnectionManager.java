@@ -30,6 +30,7 @@ import org.saiku.service.datasource.IDatasourceManager;
 import org.saiku.service.datasource.IDatasourceProcessor;
 import org.saiku.service.datasource.JdbcUrlPolicy;
 import org.saiku.service.user.UserService;
+import org.saiku.service.util.exception.SaikuAccessDeniedException;
 import org.saiku.service.util.exception.SaikuServiceException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -186,10 +187,20 @@ public abstract class AbstractConnectionManager implements IConnectionManager, S
 
         if (ds != null) {
             for (String name : ds.getDatasources(userRoles).keySet()) {
-                ISaikuConnection con = getConnection(name);
+                try {
+                    ISaikuConnection con = getConnection(name);
 
-                if (con != null) {
-                    resultDs.put(name, con);
+                    if (con != null) {
+                        resultDs.put(name, con);
+                    }
+                } catch (SaikuAccessDeniedException denied) {
+                    // saiku#1968 (CWE-863): the caller holds no Mondrian role on THIS
+                    // security-enabled datasource. Omit it from the enumeration rather than aborting
+                    // the whole loop, so a user with disjoint roles across datasources still sees the
+                    // ones they CAN access. The single-datasource query path still denies (this
+                    // exception propagates there). Mirrors the per-datasource resilience in
+                    // refreshAllConnections().
+                    log.debug("Omitting datasource {} from enumeration — access denied for caller", name);
                 }
             }
         }
