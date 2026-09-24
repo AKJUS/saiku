@@ -8,6 +8,10 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Least-privilege default token: read-only. No job here writes to the repo.
+permissions:
+  contents: read
+
 jobs:
   # Path-filter once so the downstream jobs can skip when nothing they care
   # about changed. A skipped job reports as "skipped" and counts as passing
@@ -20,8 +24,8 @@ jobs:
       ui: ${{ steps.filter.outputs.ui }}
       docs: ${{ steps.filter.outputs.docs }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: dorny/paths-filter@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
         id: filter
         with:
           # Default predicate-quantifier ("some") matches when ANY changed
@@ -58,9 +62,9 @@ jobs:
     if: needs.changes.outputs.java == 'true' || github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Set up JDK 22
-        uses: actions/setup-java@v6.0.1
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           distribution: temurin
           java-version: "22"
@@ -134,9 +138,9 @@ jobs:
       run:
         working-directory: saiku-ui
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Set up Node 24
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: "24"
           cache: npm
@@ -165,9 +169,9 @@ jobs:
     # the launcher fat-JAR is reproducible from this commit. Skipped on
     # UI-only PRs since the launcher hasn't changed.
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Set up JDK 22
-        uses: actions/setup-java@v6.0.1
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           distribution: temurin
           java-version: "22"
@@ -213,7 +217,7 @@ jobs:
           zip -r "$STAGE.zip" "$STAGE"
           ls -la "$STAGE.zip"
       - name: Upload distribution artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: saiku-dist-${{ steps.ver.outputs.version }}
           path: saiku-dist-${{ steps.ver.outputs.version }}.zip

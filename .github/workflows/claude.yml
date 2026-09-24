@@ -10,6 +10,11 @@ on:
   pull_request_review:
     types: [submitted]
 
+# Least-privilege default token: read-only. The claude job below elevates only
+# the extra scopes it needs (id-token: write, actions: read).
+permissions:
+  contents: read
+
 jobs:
   claude:
     if: |
@@ -26,13 +31,13 @@ jobs:
       actions: read # Required for Claude to read CI results on PRs
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 1
 
       - name: Run Claude Code
         id: claude
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@8cf3482550831fb35a4fc3fbf7ca139cf8028b4c # v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
