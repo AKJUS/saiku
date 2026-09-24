@@ -44,6 +44,11 @@ or filters and the SPA writes MDX for you.
 > default `admin`/`admin` once it's network-reachable, so one of those two is
 > required.
 
+> **The container runs as a non-root user** (uid/gid `10001:10001`). A named or
+> anonymous volume works out of the box. If you bind-mount a **host** directory
+> for `saiku-home`, chown it to that uid first — `sudo chown -R 10001:10001
+> /your/saiku-home` — or the container can't write to it.
+
 A hosted instance is always live at <https://demo.saiku.bi> (auto-reset
 nightly).
 

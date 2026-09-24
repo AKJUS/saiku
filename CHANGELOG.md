@@ -3,6 +3,34 @@
 All notable changes to Saiku are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Security
+
+- **Docker image now runs as a non-root user** (`saiku`, uid/gid `10001:10001`;
+  CWE-250, saiku#1989). Previously the JVM ran as uid 0 with write access to the
+  mounted `saiku-home` volume — which holds `conf/secret.key` (the AES key that
+  decrypts every stored datasource password), `users.properties`, and the
+  auto-loaded `plugins/` directory. This is the defense-in-depth layer under the
+  authenticated-user RCE chain closed in 4.8.0. The base image is now
+  digest-pinned, a `HEALTHCHECK` hits the anonymous `/rest/saiku/info` endpoint,
+  and the JVM runs with `-XX:+ExitOnOutOfMemoryError -XX:MaxRAMPercentage=75`.
+
+  **Upgrade action — bind-mounted homes only.** A fresh named/anonymous volume
+  is handled automatically (Docker seeds it from the image with the right
+  ownership). But if you bind-mount a **host** directory for `saiku-home`, that
+  directory keeps its host ownership and a non-root container can no longer write
+  to it. Chown it to the new uid/gid **once**, on the host, before starting the
+  upgraded image:
+
+  ```sh
+  sudo chown -R 10001:10001 /path/to/your/saiku-home
+  ```
+
+  For the demo box (`demo.saiku.bi`, bind mount `/opt/saiku/home`) this is
+  `sudo chown -R 10001:10001 /opt/saiku/home`. Skipping this leaves the
+  container unable to seed or persist `saiku-home` on first boot.
+
 ## 4.8.0 — 2026-09-15
 
 Minor release, and a **security release** — nine hardening fixes close an
