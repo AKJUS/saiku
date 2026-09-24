@@ -8,9 +8,11 @@ on:
         description: "Tag/version for a manual release (e.g. v3.17.0)"
         required: true
 
+# Least-privilege default: read-only for the whole workflow. Each job below
+# elevates ONLY the scope it needs (see per-job `permissions:` blocks), so a
+# retagged third-party action can never run with more than its job requires.
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 env:
   REGISTRY: ghcr.io
@@ -20,6 +22,9 @@ jobs:
   jar:
     name: Build fat JAR + dist zip
     runs-on: ubuntu-latest
+    permissions:
+      contents: read # checkout only
+      packages: write # `mvn deploy` publishes module jars to GH Packages
     outputs:
       # ref_tag is the tag as pushed (v-prefixed); version has the v
       # stripped for filenames and headings. Anything addressing GitHub
@@ -29,10 +34,10 @@ jobs:
       jar_name: ${{ steps.meta.outputs.jar_name }}
       dist_name: ${{ steps.meta.outputs.dist_name }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up JDK 22
-        uses: actions/setup-java@v6.0.1
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           distribution: temurin
           java-version: "22"
@@ -45,11 +50,11 @@ jobs:
         env:
           GH_PACKAGES_USER: ${{ github.actor }}
           GH_PACKAGES_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}
-          # GH_PACKAGES_TOKEN is a PAT scoped to read+write packages and
-          # used for resolving inbound deps (mondrian-saiku etc). For
-          # deploying THIS repo's own artifacts we use the workflow's
-          # ephemeral GITHUB_TOKEN under server id github-saiku-self —
-          # 'packages: write' is granted at the top of this workflow.
+          # GH_PACKAGES_TOKEN is a PAT used for resolving inbound deps
+          # (mondrian-saiku etc). For deploying THIS repo's own artifacts we
+          # use the workflow's ephemeral GITHUB_TOKEN under server id
+          # github-saiku-self — 'packages: write' is granted on THIS job (see
+          # the jar job's per-job `permissions:` block), not workflow-wide.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p ~/.m2
@@ -67,11 +72,25 @@ jobs:
 
       - name: Resolve version
         id: meta
+        # INPUT_TAG is user-controlled (workflow_dispatch input) — pass it
+        # through env and reference "$INPUT_TAG", never interpolate
+        # ${{ github.event.inputs.tag }} straight into the shell, or a crafted
+        # tag string could inject commands into this step (CWE-1357/CWE-78).
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            REF_TAG="${{ github.event.inputs.tag }}"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            REF_TAG="$INPUT_TAG"
           else
             REF_TAG="${GITHUB_REF_NAME}"
+          fi
+          # Strict-validate before anything is written to $GITHUB_OUTPUT: a
+          # newline-bearing dispatch input could otherwise append extra
+          # step outputs. Only vMAJOR.MINOR.PATCH (with optional -/. suffix).
+          if [[ ! "$REF_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9]+)*$ ]]; then
+            echo "::error::invalid tag: $REF_TAG (expected vMAJOR.MINOR.PATCH)"
+            exit 1
           fi
           VERSION="${REF_TAG#v}"
           echo "ref_tag=$REF_TAG" >> "$GITHUB_OUTPUT"
@@ -139,14 +158,14 @@ jobs:
           ls -la release-assets/
 
       - name: Upload JAR artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: saiku-jar
           path: release-assets/${{ steps.meta.outputs.jar_name }}
           retention-days: 7
 
       - name: Upload dist zip artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: saiku-dist
           path: release-assets/${{ steps.meta.outputs.dist_name }}
@@ -156,15 +175,18 @@ jobs:
     name: Build & push Docker image
     runs-on: ubuntu-latest
     needs: jar
+    permissions:
+      contents: read # checkout only
+      packages: write # push the image to GHCR
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # The Dockerfile no longer rebuilds saiku from sources (it can't
       # auth against the spiculedata GH Packages registries from inside
       # the Maven container). Instead it COPYs the pre-built launcher JAR
       # that the jar job produced.
       - name: Download saiku-jar
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: saiku-jar
           path: build-context
@@ -179,10 +201,10 @@ jobs:
           ls -la build-context/
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GHCR
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -190,7 +212,7 @@ jobs:
 
       - name: Image metadata
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -200,7 +222,7 @@ jobs:
             type=raw,value=latest
 
       - name: Build & push
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -215,16 +237,18 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     needs: [jar, docker]
+    permissions:
+      contents: write # create the GitHub release + upload assets
     steps:
       # Pull both artifacts the jar job uploaded — the bare versioned JAR
       # and the runnable saiku-dist zip. Both get attached to the release.
       - name: Download saiku-jar
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: saiku-jar
           path: release-assets
       - name: Download saiku-dist
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: saiku-dist
           path: release-assets
@@ -232,7 +256,7 @@ jobs:
         run: ls -la release-assets/
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           # Both files in a multi-line list. softprops/action-gh-release@v3
           # de-dupes by filename so we can list them explicitly.
@@ -279,10 +303,12 @@ jobs:
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     needs: [jar]
+    permissions:
+      contents: read # checkout only; publish auth is NPM_TOKEN, not GITHUB_TOKEN
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Node 24
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
@@ -348,6 +374,8 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     needs: [jar, release]
+    permissions:
+      contents: read # GITHUB_TOKEN only reads this repo's release notes; the cross-repo PR uses DOCS_SITE_PAT
     steps:
       # The PR needs to land in spiculedata/saiku-cloud — which means we
       # need a token with `repo` scope on THAT repo. The default
@@ -369,7 +397,7 @@ jobs:
 
       - name: Checkout saiku-cloud
         if: steps.guard.outputs.skip != 'true'
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: spiculedata/saiku-cloud
           token: ${{ secrets.DOCS_SITE_PAT }}
@@ -397,7 +425,7 @@ jobs:
           NOTES=$(curl -sSL \
             -H "Authorization: Bearer ${GITHUB_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${REF_TAG}" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${REF_TAG}" \
             | python3 -c "import json,sys; print(json.load(sys.stdin).get('body','') or '')")
 
           # Build the new section in a temp file rather than a shell
@@ -489,7 +517,7 @@ jobs:
             --title "docs(changelog): draft entry for ${VERSION}" \
             --body "Auto-opened by the saiku release workflow. The new section at the top of \`help/changelog.mdx\` is a draft — replace the placeholder bullet with a customer-facing summary of what changed, then merge.
 
-          See [saiku release ${VERSION}](https://github.com/${{ github.repository }}/releases/tag/${REF_TAG}) for the full notes.")
+          See [saiku release ${VERSION}](https://github.com/${GITHUB_REPOSITORY}/releases/tag/${REF_TAG}) for the full notes.")
           echo "Opened: $PR_URL"
           # Best-effort labelling — surface a warning but don't fail.
           gh pr edit "$PR_URL" --repo spiculedata/saiku-cloud --add-label docs --add-label release \

@@ -35,10 +35,10 @@ jobs:
     name: Build, verify, publish to npm
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Node 24
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
@@ -84,9 +84,10 @@ jobs:
         # swallowed error hides a genuine failure (bad token, registry outage)
         # behind the same warning as the benign already-published case.
         id: registry
+        env:
+          VERSION: ${{ steps.verify.outputs.version }}
         run: |
           set -euo pipefail
-          VERSION="${{ steps.verify.outputs.version }}"
           if npm view "@concepttocloud/saiku-design-system@$VERSION" version >/dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "::notice::@concepttocloud/saiku-design-system@$VERSION is already published — nothing to do. Bump the version in saiku-ui/design-system/package.json to cut a new release."
@@ -105,11 +106,14 @@ jobs:
         run: npm publish --access public
 
       - name: Summary
+        env:
+          VERSION: ${{ steps.verify.outputs.version }}
+          ALREADY_PUBLISHED: ${{ steps.registry.outputs.exists }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          VERSION="${{ steps.verify.outputs.version }}"
-          if [ "${{ steps.registry.outputs.exists }}" = "true" ]; then
+          if [ "$ALREADY_PUBLISHED" = "true" ]; then
             echo "⏭  @concepttocloud/saiku-design-system@$VERSION already published — skipped." >> "$GITHUB_STEP_SUMMARY"
-          elif [ "${{ inputs.dry_run }}" = "true" ]; then
+          elif [ "$DRY_RUN" = "true" ]; then
             echo "🧪 Dry run — @concepttocloud/saiku-design-system@$VERSION built and verified, not published." >> "$GITHUB_STEP_SUMMARY"
           else
             echo "✅ Published @concepttocloud/saiku-design-system@$VERSION" >> "$GITHUB_STEP_SUMMARY"
