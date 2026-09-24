@@ -16,20 +16,35 @@ All notable changes to Saiku are documented here. This project follows
   digest-pinned, a `HEALTHCHECK` hits the anonymous `/rest/saiku/info` endpoint,
   and the JVM runs with `-XX:+ExitOnOutOfMemoryError -XX:MaxRAMPercentage=75`.
 
-  **Upgrade action — bind-mounted homes only.** A fresh named/anonymous volume
-  is handled automatically (Docker seeds it from the image with the right
-  ownership). But if you bind-mount a **host** directory for `saiku-home`, that
-  directory keeps its host ownership and a non-root container can no longer write
-  to it. Chown it to the new uid/gid **once**, on the host, before starting the
-  upgraded image:
+  **Upgrade action — any pre-existing `saiku-home` (named volume OR bind mount).**
+  Docker only seeds image ownership into a *fresh, empty* volume. A `saiku-home`
+  written by an older root container — whether a named/anonymous volume or a
+  bind-mounted host directory — stays root-owned, and the non-root container can
+  no longer read `conf/secret.key` or write the home. Re-own it to `10001:10001`
+  **once** before starting the upgraded image:
 
   ```sh
+  # Bind-mounted host directory:
   sudo chown -R 10001:10001 /path/to/your/saiku-home
+
+  # Named Docker volume (run once, as root, using the image itself):
+  docker run --rm -v saiku-home:/app/saiku-home --user 0 \
+    --entrypoint chown ghcr.io/spiculedata/saiku:<version> \
+    -R 10001:10001 /app/saiku-home
   ```
 
   For the demo box (`demo.saiku.bi`, bind mount `/opt/saiku/home`) this is
-  `sudo chown -R 10001:10001 /opt/saiku/home`. Skipping this leaves the
-  container unable to seed or persist `saiku-home` on first boot.
+  `sudo chown -R 10001:10001 /opt/saiku/home`.
+
+  Skipping this no longer fails silently: the entrypoint runs a pre-flight and
+  **refuses to start with a `FATAL:` message** (naming the exact `chown`) if the
+  home is unwritable or `secret.key` is unreadable — so you can't accidentally
+  rotate the AES key and orphan stored datasource passwords. A genuinely fresh,
+  empty home still boots normally.
+
+  **Kubernetes:** PVCs don't inherit image ownership either — set
+  `securityContext: { runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001 }` on
+  the pod so the mounted volume is group-owned by the runtime user.
 
 ## 4.8.0 — 2026-09-15
 

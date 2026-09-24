@@ -44,10 +44,16 @@ or filters and the SPA writes MDX for you.
 > default `admin`/`admin` once it's network-reachable, so one of those two is
 > required.
 
-> **The container runs as a non-root user** (uid/gid `10001:10001`). A named or
-> anonymous volume works out of the box. If you bind-mount a **host** directory
-> for `saiku-home`, chown it to that uid first — `sudo chown -R 10001:10001
-> /your/saiku-home` — or the container can't write to it.
+> **The container runs as a non-root user** (uid/gid `10001:10001`). A *fresh*
+> named/anonymous volume works out of the box. Any **pre-existing** `saiku-home`
+> from an older root container — bind mount or named volume — must be re-owned
+> once: `sudo chown -R 10001:10001 <host-dir>`, or for a named volume
+> `docker run --rm -v saiku-home:/app/saiku-home --user 0 --entrypoint chown
+> ghcr.io/spiculedata/saiku:latest -R 10001:10001 /app/saiku-home`. The
+> container fails closed with a `FATAL:` message (naming the fix) rather than
+> silently rotating its encryption key. On Kubernetes set
+> `securityContext: { runAsUser: 10001, fsGroup: 10001 }`. See the
+> [CHANGELOG](CHANGELOG.md) upgrade note for details.
 
 A hosted instance is always live at <https://demo.saiku.bi> (auto-reset
 nightly).

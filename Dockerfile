@@ -23,12 +23,18 @@ ARG OTEL_AGENT_SHA256=faa89bdeebf9b1f52be4a4374689176717b02a59df2d8f8b6eb9aa39f9
 # Non-root runtime user (#1989, CWE-250). uid/gid are FIXED and DOCUMENTED at
 # 10001:10001 so operators who bind-mount a host directory for saiku-home can
 # `chown 10001:10001` it deterministically across upgrades. Do NOT change these
-# numbers without a migration note — existing bind mounts are chowned to them.
+# numbers without a migration note — existing homes are chowned to them.
+#
+# HOME is /home/saiku (created + owned by the user), NOT /app: /app and the jar
+# stay root-owned (see the chown note below), so a HOME there would be
+# read-only. The JVM writes per-user scratch under HOME (e.g. ~/.java/fonts for
+# AWT font caching used by chart/PDF/XLS export rendering); it needs a writable
+# home of its own.
 ARG SAIKU_UID=10001
 ARG SAIKU_GID=10001
 RUN groupadd --gid "${SAIKU_GID}" saiku \
     && useradd --uid "${SAIKU_UID}" --gid "${SAIKU_GID}" \
-       --home-dir /app --no-create-home --shell /usr/sbin/nologin saiku
+       --home-dir /home/saiku --create-home --shell /usr/sbin/nologin saiku
 
 WORKDIR /app
 
@@ -48,36 +54,48 @@ RUN set -eux; \
 
 ENV SAIKU_HOME=/app/saiku-home
 
-# JVM safety defaults (#1989 / #1919 item 18a). Set via JAVA_TOOL_OPTIONS
-# rather than JAVA_OPTS on purpose: the entrypoint treats JAVA_OPTS as
-# operator-supplied overrides and would drop these the moment someone passes
-# their own `-e JAVA_OPTS=...`. JAVA_TOOL_OPTIONS is picked up by the JVM
-# additively and independently, so the safety flags always apply; an operator
-# can still override an individual flag on the command line via JAVA_OPTS
-# (command-line wins over JAVA_TOOL_OPTIONS for the same option).
+# JVM safety defaults (#1989 / #1919 item 18a). Set via JAVA_TOOL_OPTIONS so
+# the JVM applies them regardless of how it is launched, and so an operator's
+# `-e JAVA_OPTS=...` (which the entrypoint MERGES onto the command line, not
+# replaces) adds to rather than erases them. Command-line flags win over
+# JAVA_TOOL_OPTIONS for the same option, so an operator can still override an
+# individual flag via JAVA_OPTS. Caveat: passing `-e JAVA_TOOL_OPTIONS=...`
+# REPLACES this value (env vars don't merge) — override individual flags via
+# JAVA_OPTS instead. Note the JVM prints "Picked up JAVA_TOOL_OPTIONS: ..." to
+# stderr on every launch; that line is expected and benign.
 #   -XX:+ExitOnOutOfMemoryError  fail fast on OOM so the orchestrator restarts
 #                                a clean JVM instead of limping on a corrupt heap
 #   -XX:MaxRAMPercentage=75      size the heap from the container memory limit
 ENV JAVA_TOOL_OPTIONS="-XX:+ExitOnOutOfMemoryError -XX:MaxRAMPercentage=75"
 
-# Ownership must be set BEFORE the VOLUME line: Docker seeds a fresh (empty)
+# Ownership, scoped tightly (#1989 S1 review). ONLY /app/saiku-home (the write
+# path — data, repository, sessions, logs, plugins, and conf/secret.key) is
+# handed to the runtime uid. Everything the JVM merely EXECUTES stays root-owned
+# and world-readable: /app/saiku.jar and /opt/saiku/otel/*.jar keep their
+# COPY/RUN defaults (0644, uid 0). That means a code-exec-as-saiku compromise
+# (the 4.8.0 RCE class this hardening defends against) cannot rewrite or unlink
+# the very jar/agent it runs from and persist across `docker restart`.
+#
+# The chown must precede the VOLUME line: Docker seeds a fresh (empty)
 # named/anonymous volume from the image mount-point, carrying its ownership +
-# perms across. A chown AFTER VOLUME would not stick to the volume. We
-# pre-create /app/saiku-home so its ownership is what a new volume inherits.
-# (Bind mounts are NOT chowned by Docker — see the upgrade note in CHANGELOG.)
+# perms across. A chown AFTER VOLUME would not stick. We pre-create
+# /app/saiku-home so its ownership is what a new volume inherits. (Bind mounts
+# and PRE-EXISTING volumes are NOT chowned by Docker — see the upgrade note in
+# CHANGELOG; the entrypoint also fails closed if the home is unusable.)
 RUN mkdir -p /app/saiku-home \
-    && chown -R "${SAIKU_UID}:${SAIKU_GID}" /app /opt/saiku
+    && chown "${SAIKU_UID}:${SAIKU_GID}" /app/saiku-home
 
 VOLUME ["/app/saiku-home"]
 EXPOSE 8080
 
-# Liveness probe. /rest/saiku/info is anonymous (security="none") and has a
-# cheap HEAD/GET handler, so no credentials are needed. curl ships in the
-# Ubuntu-noble base (it is already used above to fetch the OTel agent).
-# start-period is generous: first boot seeds saiku-home + runs the H2 FoodMart
-# bootstrap (~30s, ~200MB) before the port answers.
+# Liveness probe. /rest/saiku/info is anonymous (security="none"), so no
+# credentials are needed. Use HEAD (--head): InfoResource added a dedicated
+# HEAD handler in saiku#866 precisely for monitors — a GET walks the plugin
+# directory. curl ships in the Ubuntu-noble base (already used above to fetch
+# the OTel agent). start-period is generous: first boot seeds saiku-home + runs
+# the H2 FoodMart bootstrap (~30s, ~200MB) before the port answers.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
-  CMD curl -fsS http://localhost:8080/rest/saiku/info || exit 1
+  CMD curl -fsS -o /dev/null --head http://localhost:8080/rest/saiku/info || exit 1
 
 # Drop to the non-root user for the actual runtime. Everything above ran as
 # root (package install, OTel download, chown); nothing below needs it.

@@ -12,6 +12,16 @@ updates:
       interval: weekly
     open-pull-requests-limit: 3
     labels: [dependencies, github-actions]
+  # The Dockerfile FROM is digest-pinned (eclipse-temurin:21-jre-noble@sha256:…)
+  # for supply-chain integrity (#1989). Dependabot understands the tag@sha256
+  # form and bumps BOTH the tag and the digest, so the base JRE gets CVE-driven
+  # update PRs instead of freezing on a stale digest.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    labels: [dependencies, docker]
   # saiku-ui has its own package.json and is not part of the Maven reactor, so
   # it needs its own entry — without one it is never scanned at all.
   #
