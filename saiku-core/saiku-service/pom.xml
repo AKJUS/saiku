@@ -16,7 +16,7 @@
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>3.5.2</version>
                 <configuration>
-                    <argLine>-Xmx512m --add-opens=java.base/java.nio=ALL-UNNAMED</argLine>
+                    <argLine>@{argLine} -Xmx512m --add-opens=java.base/java.nio=ALL-UNNAMED</argLine>
                 </configuration>
             </plugin>
             <plugin>
