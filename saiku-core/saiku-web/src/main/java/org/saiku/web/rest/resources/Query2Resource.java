@@ -942,7 +942,16 @@ public class Query2Resource {
             return Response.ok(body).type(MediaType.APPLICATION_JSON).build();
         } catch (Exception e) {
             log.error("Cannot discover drillthrough columns (" + queryName + ")", e);
-            return queryFailure(e);
+            // Unlike queryFailure(e), never echo the root cause: the underlying failure can be
+            // a JDBC/olap4j exception whose message embeds the datasource URL, including
+            // embedded credentials (e.g. "jdbc:postgresql://host/db?user=x&password=y"). The
+            // full exception is already logged above for operators; the caller only needs the
+            // status code.
+            Status status = isClientError(e) ? Status.BAD_REQUEST : Status.INTERNAL_SERVER_ERROR;
+            return Response.status(status)
+                    .entity(new QueryResult("Cannot discover drillthrough columns for query: " + queryName))
+                    .type(MediaType.APPLICATION_JSON)
+                    .build();
         }
     }
 

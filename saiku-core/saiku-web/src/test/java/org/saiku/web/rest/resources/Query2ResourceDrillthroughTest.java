@@ -150,8 +150,7 @@ public class Query2ResourceDrillthroughTest {
     private static final String ARROW = "application/vnd.apache.arrow.stream";
 
     private static HttpHeaders arrowHeaders() {
-        final List<MediaType> list =
-                Arrays.asList(MediaType.valueOf(ARROW), MediaType.APPLICATION_JSON_TYPE);
+        final List<MediaType> list = Arrays.asList(MediaType.valueOf(ARROW), MediaType.APPLICATION_JSON_TYPE);
         return (HttpHeaders) Proxy.newProxyInstance(
                 Query2ResourceDrillthroughTest.class.getClassLoader(),
                 new Class<?>[] {HttpHeaders.class},
