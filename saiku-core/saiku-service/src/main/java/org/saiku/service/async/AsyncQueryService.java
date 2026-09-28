@@ -125,13 +125,21 @@ public class AsyncQueryService {
      * resolving the scoped proxy without propagation throws
      * "Scope 'session' is not active for the current thread".
      *
-     * <p>TODO: if the submitting HTTP request finishes and its session is
-     * invalidated before the worker runs, the scoped proxy will still fail.
-     * We rely on the client polling, which keeps the session alive.
+     * <p>The session is obtained here, on the calling thread, so the attributes
+     * cache it: the worker often first touches the scoped proxy after the HTTP
+     * request has completed, and a completed ServletRequestAttributes can only
+     * create a session-scoped bean through a session it already holds.
+     *
+     * <p>TODO: if the session is invalidated before the worker runs, the scoped
+     * proxy will still fail. We rely on the client polling, which keeps the
+     * session alive.
      */
     public AsyncQueryHandle submit(final ThinQuery query, final RequestAttributes requestAttributes) {
         if (thinQueryService == null) {
             throw new IllegalStateException("AsyncQueryService.thinQueryService not wired — cannot submit");
+        }
+        if (requestAttributes != null) {
+            requestAttributes.getSessionId();
         }
         final String id = UUID.randomUUID().toString();
         final AsyncQueryHandle handle = new AsyncQueryHandle(id, query, currentPrincipal());
