@@ -7,6 +7,26 @@ All notable changes to Saiku are documented here. This project follows
 
 ### Security
 
+- **Hive/Hadoop are no longer bundled; the Hive JDBC driver is an opt-in
+  `plugins/` drop-in** (CWE-1104 / CWE-1395, saiku#1916). `hive-cli`,
+  `hive-jdbc` and `hadoop-common` pulled ~150 Hadoop/Hive/YARN/ZooKeeper server
+  jars into the WAR purely so `jdbc:hive2://` URLs would load — among them
+  ZooKeeper 3.4.6, a full Jetty 9.4 stack, YARN ResourceManager and LLAP
+  classes, a test jar, gson 2.2.4, avro 1.7.7, jackson-mapper-asl 1.9.13 and
+  jsch 0.1.55. The WAR also carried `log4j-1.2.x` next to the `log4j-1.2-api`
+  bridge (both define `org.apache.log4j`, so which class loaded depended on jar
+  order) plus extra slf4j bindings; `log4j:log4j` is now excluded from
+  `olap4j-xmlaserver` as well, which only needs `Logger` from the bridge. A
+  `maven-enforcer` `bannedDependencies` rule in the root pom fails the build if
+  any of it comes back.
+
+  **Upgrade action — Hive / Spark Thrift users.** Copy the standalone Hive
+  JDBC driver (`hive-jdbc-<version>-standalone.jar`) into
+  `saiku-home/plugins/` and restart; see *Adding a Hive / Spark Thrift
+  datasource* in `dist/README.md`. **SQL Server users**: the old
+  `mssql-jdbc` 6.2.1 driver was only on the classpath as a side effect of the
+  Hive tree, so drop a current `mssql-jdbc` jar into `plugins/` too.
+
 - **Docker image now runs as a non-root user** (`saiku`, uid/gid `10001:10001`;
   CWE-250, saiku#1989). Previously the JVM ran as uid 0 with write access to the
   mounted `saiku-home` volume — which holds `conf/secret.key` (the AES key that
