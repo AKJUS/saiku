@@ -47,7 +47,6 @@ public class ThinQueryTypedParameterTest {
         Map<String, String> params = new HashMap<>();
         params.put("brand", "Denny");
         tq.setParameters(params);
-        assertEquals(
-                "SELECT FROM [Sales] WHERE ([Time].[1997], [Product].[Denny])", tq.getParameterResolvedMdx());
+        assertEquals("SELECT FROM [Sales] WHERE ([Time].[1997], [Product].[Denny])", tq.getParameterResolvedMdx());
     }
 }

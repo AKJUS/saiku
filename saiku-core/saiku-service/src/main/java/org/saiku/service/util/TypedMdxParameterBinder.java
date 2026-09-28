@@ -135,9 +135,8 @@ public final class TypedMdxParameterBinder {
     /** Rendered as an MDX set ({@code {a, b}}) or tuple ({@code (a, b)}) of validated members. */
     private static String renderList(String name, Object value, String open, String close) {
         if (!(value instanceof List)) {
-            throw new SaikuServiceException(
-                    "Parameter '" + name + "' is declared as a " + (open.equals("{") ? "set" : "tuple")
-                            + " but its value is not a list of member unique names");
+            throw new SaikuServiceException("Parameter '" + name + "' is declared as a "
+                    + (open.equals("{") ? "set" : "tuple") + " but its value is not a list of member unique names");
         }
         List<?> items = (List<?>) value;
         if (items.isEmpty()) {

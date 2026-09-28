@@ -109,8 +109,7 @@ public class TypedMdxParameterBinderTest {
         Map<String, Parameter> params = new HashMap<>();
         params.put(
                 "years",
-                new Parameter(
-                        "years", Parameter.ParameterType.SET, Arrays.asList("[Time].[1997]", "[Time].[1998]")));
+                new Parameter("years", Parameter.ParameterType.SET, Arrays.asList("[Time].[1997]", "[Time].[1998]")));
         String out = TypedMdxParameterBinder.bind("SELECT :years ON 0 FROM [Sales]", params);
         assertEquals("SELECT {[Time].[1997], [Time].[1998]} ON 0 FROM [Sales]", out);
     }
