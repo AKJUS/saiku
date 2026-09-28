@@ -28,6 +28,19 @@ mvn -P integration verify                                              # run the
 GitHub-Packages artifacts (`mondrian-saiku`, `olap4j`, `olap4j-xmlaserver`, `saiku-query`) — see
 `CLAUDE.md`. Locally pass `-s "<settings.xml>"` if it isn't at the default path.
 
+### UI end-to-end (Playwright)
+
+`saiku-ui/e2e/` holds the browser suite (`saiku-ui/playwright.config.ts`). The mocked-backend
+specs intercept `/rest/saiku/*` and need no Java; CI's `ui` job runs them after the production
+build (saiku#2009). `*.live.spec.ts` specs need a running launcher and stay out of CI.
+
+```bash
+cd saiku-ui
+npx playwright install chromium   # one-time
+npm run e2e                       # mocked backend: builds, then serves on :4173
+npm run e2e:live                  # live backend on :8080 (RUN_LIVE_E2E=1)
+```
+
 ## Current coverage
 
 Roughly **990 `@Test` methods across ~155 test classes** (a long way past the Phase-0 baseline of 10).

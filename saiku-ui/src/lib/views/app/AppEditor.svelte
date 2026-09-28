@@ -7,10 +7,10 @@
 	 * whenever the path changes (SvelteKit reuses the route component across
 	 * navigations), then renders AppShell against appDoc.current.
 	 *
-	 * Edit vs. view: opens in edit mode (editable). A toggle in the header
-	 * controls flips to read-only "view" mode analogous to a dashboard's
-	 * presentation preview — AppShell's `editable` prop drives whether page
-	 * add / rename affordances and in-grid editing are shown.
+	 * Edit vs. view: a saved app opens in read-only "view"; a newly created one
+	 * opens in edit (appOpenMode). A toggle in the header controls flips between
+	 * them — AppShell's `editable` prop drives whether page add / rename
+	 * affordances and in-grid editing are shown.
 	 */
 	import { onMount, untrack } from 'svelte';
 	import { page } from '$app/state';
@@ -20,6 +20,7 @@
 	import { i18n } from '$lib/stores/i18n.svelte';
 	import { Save, Pencil, Eye, Palette } from '@lucide/svelte';
 	import AppShell from '$lib/views/app/AppShell.svelte';
+	import { initialAppMode, type AppMode } from '$lib/views/app/appOpenMode';
 	import AppInspector, {
 		type InspectorSection
 	} from '$lib/views/app/inspector/AppInspector.svelte';
@@ -32,9 +33,10 @@
 
 	/** View mode. A saved app opens in read-only "view" (the clean published
 	 *  experience — no add-tile / filters / tile toolbars); the header's Edit
-	 *  button toggles into "edit". Authoring a brand-new app can still start in
-	 *  edit via the builder entry point. */
-	let mode = $state<'edit' | 'view'>('view');
+	 *  button toggles into "edit". A brand-new app opens in edit — the create
+	 *  flow navigates with `?edit=1` (see appOpenMode). Read once at init: the
+	 *  app's URL-state mirror rewrites the query string afterwards. */
+	let mode = $state<AppMode>(initialAppMode(page.url.searchParams));
 	let saving = $state<boolean>(false);
 
 	// Kiosk: `?chrome=none` renders the app as a pure viewer — no edit/save

@@ -133,7 +133,7 @@ jobs:
           exit "$fail"
 
   ui:
-    name: ui (svelte-check + vitest + build)
+    name: ui (svelte-check + vitest + build + e2e)
     needs: changes
     if: needs.changes.outputs.ui == 'true' || github.event_name == 'push'
     runs-on: ubuntu-latest
@@ -161,6 +161,20 @@ jobs:
       # build's fault, not a type/test failure. (saiku#1551)
       - name: Production build
         run: npm run build
+      # Mocked-backend Playwright suite (saiku#2009). Reuses the build above:
+      # with CI set, playwright.config.ts's webServer only runs `vite preview`.
+      # Live specs (*.live.spec.ts) stay excluded — they need a running launcher.
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+      - name: E2E (Playwright, mocked backend)
+        run: npm run e2e
+      - name: Upload Playwright traces
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: playwright-test-results
+          path: saiku-ui/test-results/
+          retention-days: 7
 
   dist:
     name: bundle (saiku-dist zip)
