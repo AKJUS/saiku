@@ -200,11 +200,12 @@ See [`CLAUDE.md`](CLAUDE.md) for the full layout, the dependency catalog
 
 ## Verifying release artifacts
 
-The fat JAR, dist zip, container image and npm packages are all signed
-via [Sigstore](https://www.sigstore.dev/) and carry SLSA build
-provenance — see [`docs/VERIFYING-RELEASES.md`](docs/VERIFYING-RELEASES.md)
-for a worked verification example per artifact type
-(`gh attestation verify`, `cosign verify`, `npm audit signatures`).
+The fat JAR, dist zip, SBOM, container image and npm packages carry
+keyless [Sigstore](https://www.sigstore.dev/)-signed SLSA build provenance,
+and each release ships a `SHA256SUMS` file. See
+[Verifying release artifacts](docs/releasing.md#verifying-release-artifacts)
+for the commands per artifact type (`gh attestation verify`,
+`cosign verify-attestation`, `sha256sum -c`, `npm audit signatures`).
 
 ## Repository layout
 
