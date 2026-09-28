@@ -36,11 +36,14 @@ export default defineConfig({
 	// Boot the vite preview server for the mocked path. `npm run preview` serves the built
 	// static output on :4173 — running against dev's :5173 works too but produces a lot of
 	// noise from HMR. Skip webServer entirely when RUN_LIVE_E2E=1 so we target the real
-	// launcher.
+	// launcher. In CI the workflow builds in its own step first (saiku#2009), so a build
+	// break fails there rather than eating this server-start timeout.
 	webServer: runLive
 		? undefined
 		: {
-				command: 'npm run build && npm run preview -- --port 4173 --host 127.0.0.1',
+				command: process.env.CI
+					? 'npm run preview -- --port 4173 --host 127.0.0.1'
+					: 'npm run build && npm run preview -- --port 4173 --host 127.0.0.1',
 				url: 'http://localhost:4173',
 				reuseExistingServer: !process.env.CI,
 				timeout: 180_000

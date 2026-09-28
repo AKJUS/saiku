@@ -472,8 +472,11 @@ nbdist/
 !/lib/repo/
 !/lib/repo/**
 
-# Claude Code session worktrees / scratch (never commit)
-.claude/
+# Claude Code session worktrees / scratch (never commit) — except the shared,
+# reviewed agent assets: project skills and the corrections log (see AGENTS.md).
+.claude/*
+!.claude/skills/
+!.claude/memory/
 
 # git worktrees
 .worktrees/

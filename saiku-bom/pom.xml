@@ -57,7 +57,7 @@
              1.4.1 defaults to. 24.3 is the last stable in the 24.x line;
              25+ is fine but the Jackson-json-node integration on 24.x is well
              exercised. -->
-        <graphqlJava.version>24.3</graphqlJava.version>
+        <graphqlJava.version>26.1</graphqlJava.version>
         <!-- graphql-java-extended-scalars supplies the JSON, DateTime, Object
              scalars we need to type Ossie filter payloads + typed cell values.
              Version tracks the graphql-java major line. -->
@@ -209,10 +209,16 @@
                 <artifactId>jackson-jaxrs-json-provider</artifactId>
                 <version>${jackson.version}</version>
             </dependency>
+            <!-- JUnit 5+/6 artifacts (jupiter, vintage, platform) must share one version: a
+                 jupiter 6 engine against a 1.x platform fails at fork time with
+                 NoClassDefFoundError org/junit/platform/engine/OutputDirectoryCreator. Importing
+                 junit-bom keeps them in lockstep, so children declare them without a version. -->
             <dependency>
-                <groupId>org.junit.jupiter</groupId>
-                <artifactId>junit-jupiter</artifactId>
-                <version>5.11.3</version>
+                <groupId>org.junit</groupId>
+                <artifactId>junit-bom</artifactId>
+                <version>6.1.3</version>
+                <type>pom</type>
+                <scope>import</scope>
             </dependency>
             <!-- POI 3.17 (2017) is EOL. 5.x line is the maintained successor;
                  5.4.0 is the current release. API surface for HSSF/XSSF

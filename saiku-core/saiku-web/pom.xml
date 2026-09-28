@@ -37,7 +37,7 @@
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>3.5.2</version>
                 <configuration>
-                    <argLine>-Xmx512m --add-opens=java.base/java.nio=ALL-UNNAMED</argLine>
+                    <argLine>@{argLine} -Xmx512m --add-opens=java.base/java.nio=ALL-UNNAMED</argLine>
                 </configuration>
             </plugin>
 
@@ -309,11 +309,6 @@
                 <version>2.7</version>
                 <configuration>
                 </configuration>
-            </plugin>
-            <plugin>
-                <groupId>org.codehaus.mojo</groupId>
-                <artifactId>cobertura-maven-plugin</artifactId>
-                <version>2.4</version>
             </plugin>
         </plugins>
     </reporting>

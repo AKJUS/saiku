@@ -169,10 +169,17 @@ public class AsyncQueryService {
      * {@link RequestAttributes} remain as a harmless fallback for any request/session lookup the
      * query path might still make. The {@link SecurityContext} propagation below is what keeps role
      * resolution correct on the worker (saiku#1968).
+     *
+     * <p>The session is also obtained here, on the calling thread, so the propagated attributes
+     * cache it: any session lookup the query path makes through them after the request has
+     * completed then resolves through the cached session instead of failing.
      */
     public AsyncQueryHandle submit(final ThinQuery query, final RequestAttributes requestAttributes) {
         if (thinQueryService == null) {
             throw new IllegalStateException("AsyncQueryService.thinQueryService not wired — cannot submit");
+        }
+        if (requestAttributes != null) {
+            requestAttributes.getSessionId();
         }
         final String id = UUID.randomUUID().toString();
         final AsyncQueryHandle handle = new AsyncQueryHandle(id, query, currentPrincipal());

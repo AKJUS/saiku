@@ -24,6 +24,7 @@
 	import { toasts } from '$lib/stores/toasts.svelte';
 	import { i18n } from '$lib/stores/i18n.svelte';
 	import { importArgsFromDashboard } from '$lib/views/app/appImport';
+	import { newAppHref } from '$lib/views/app/appOpenMode';
 	import { Skeleton } from '$lib/design-system';
 	import EmptyState from '$lib/components/EmptyState.svelte';
 	import Modal from '$lib/components/Modal.svelte';
@@ -134,7 +135,7 @@
 				appDoc.newApp(name);
 			}
 			await appDoc.saveApp(path, name);
-			await goto(`${base}/apps/${path}`);
+			await goto(newAppHref(base, path));
 		} catch (e: unknown) {
 			createError = e instanceof Error ? e.message : String(e);
 		} finally {

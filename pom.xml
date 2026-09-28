@@ -44,6 +44,10 @@
         <!-- bi.saiku.ossie:ossie-core — external Ossie/OSI parser library
              (spiculedata/ossie). Track its releases and bump here. -->
         <ossie.version>0.1.0</ossie.version>
+        <!-- saiku#2011: JaCoCo's prepare-agent sets this to its -javaagent flag;
+             module surefire configs prepend it as @{argLine}. The empty default
+             keeps @{argLine} resolvable when JaCoCo is skipped (-Djacoco.skip). -->
+        <argLine></argLine>
     </properties>
     <repositories>
         <!-- In-tree Maven file-repo for vendored deps that aren't reachable on
@@ -172,6 +176,38 @@
                         <goals>
                             <goal>check</goal>
                         </goals>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <!-- saiku#2011: line coverage per module, written to
+                     target/site/jacoco/jacoco.csv. CI gates it against
+                     .coverage-thresholds.json via scripts/check-coverage.sh. -->
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <version>0.8.15</version>
+                <executions>
+                    <execution>
+                        <id>jacoco-prepare-agent</id>
+                        <goals>
+                            <goal>prepare-agent</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>jacoco-report</id>
+                        <phase>verify</phase>
+                        <goals>
+                            <goal>report</goal>
+                        </goals>
+                        <configuration>
+                            <!-- saiku-launcher's target/classes embeds webapp/saiku.war;
+                                 analysing its multi-release jars fails on duplicate
+                                 class names. Report on the module's own classes only. -->
+                            <excludes>
+                                <exclude>**/*.war</exclude>
+                                <exclude>**/*.jar</exclude>
+                            </excludes>
+                        </configuration>
                     </execution>
                 </executions>
             </plugin>
