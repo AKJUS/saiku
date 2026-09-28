@@ -117,5 +117,5 @@ CI (`.github/workflows/ci.yml`) runs `mvn -B -ntp -DskipITs=false verify` on **u
 ## Agent resources
 
 - **Skills** — `.claude/skills/<name>/SKILL.md`: step-by-step workflows for recurring repo tasks (rebuilding the launcher after UI changes, cutting a release). Claude Code loads them automatically; other agents can read them as plain markdown.
-- **Prompts** — `.github/prompts/*.prompt.md`: reusable task prompts (fix a bug test-first, add an AI Query API field). Copilot exposes them as `/` commands; for other tools, paste or reference the file.
+- **Prompts** — `.github/prompts/*.prompt.md`: reusable task prompts (fix a bug test-first, add a REST endpoint). Copilot exposes them as `/` commands; for other tools, paste or reference the file.
 - **Corrections log** — `.claude/memory/corrections.md`: conventions a human had to correct an agent on. Read it before starting work. When a maintainer corrects you on something this file doesn't already cover, append an entry (format at the top of that file) in the same PR. If a correction is general enough, promote it into this file instead and delete the entry.
