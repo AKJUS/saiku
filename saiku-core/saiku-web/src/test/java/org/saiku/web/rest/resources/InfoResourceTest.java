@@ -250,7 +250,9 @@ public class InfoResourceTest {
         assertEquals(Boolean.TRUE, ask.get("configured"));
         assertEquals(NlAskProviderFactory.DEFAULT_OLLAMA_ENDPOINT, ask.get("endpoint"));
         for (Object v : ask.values()) {
-            assertFalse("diagnostics must never surface an api key", String.valueOf(v).contains("sk-"));
+            assertFalse(
+                    "diagnostics must never surface an api key",
+                    String.valueOf(v).contains("sk-"));
         }
     }
 

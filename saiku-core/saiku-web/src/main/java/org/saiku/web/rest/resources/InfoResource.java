@@ -219,10 +219,7 @@ public class InfoResource {
     public Response getDiagnostics() {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put(
-                "ask",
-                askProviderFactory == null
-                        ? disabledAiStack()
-                        : describeAiStack(askProviderFactory.describe()));
+                "ask", askProviderFactory == null ? disabledAiStack() : describeAiStack(askProviderFactory.describe()));
         body.put(
                 "schemaGen",
                 schemaGenProviderFactory == null
@@ -278,7 +275,8 @@ public class InfoResource {
                 port = "https".equalsIgnoreCase(uri.getScheme()) ? 443 : 80;
             }
             try (Socket socket = new Socket()) {
-                socket.connect(new InetSocketAddress(host, port), (int) Duration.ofSeconds(2).toMillis());
+                socket.connect(new InetSocketAddress(host, port), (int)
+                        Duration.ofSeconds(2).toMillis());
                 return true;
             }
         } catch (Exception e) {
