@@ -22,8 +22,8 @@ Two traps make a naive `mvn package` go wrong here; this sequence avoids both.
 4. **Run it.**
    ```bash
    VERSION=$(mvn -q -DforceStdout help:evaluate -Dexpression=project.version)
-   java -jar saiku-launcher/target/saiku-$VERSION.jar serve --port 8080 --home ./saiku-home
+   SAIKU_ALLOW_DEFAULT_ADMIN=true java -jar saiku-launcher/target/saiku-$VERSION.jar serve --port 8080 --home ./saiku-home
    ```
-   UI at http://localhost:8080/ui/, REST at http://localhost:8080/saiku/api/, login `admin` / `admin`.
+   UI at http://localhost:8080/ui/, REST at http://localhost:8080/rest/saiku/api/, login `admin` / `admin`. Without `SAIKU_ALLOW_DEFAULT_ADMIN=true` (or `SAIKU_DEMO=true`, or a real `SAIKU_ADMIN_PASSWORD`) the launcher refuses to boot on the default password.
 
 If you changed the FoodMart seed schema (`saiku-launcher/src/main/resources/seed/FoodMart4.xml`), an existing `saiku-home` won't pick it up. Delete `saiku-home/data/FoodMart4.xml` before relaunching.

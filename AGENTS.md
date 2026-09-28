@@ -22,11 +22,12 @@ mvn -P security verify                        # OWASP dependency-check (opt-in)
 Run the launcher fat-JAR (Picocli + embedded Jetty 12 EE10):
 
 ```bash
-java -jar saiku-launcher/target/saiku-<version>.jar serve --port 8080 --home ./saiku-home
+SAIKU_ALLOW_DEFAULT_ADMIN=true java -jar saiku-launcher/target/saiku-<version>.jar serve --port 8080 --home ./saiku-home
 # <version> is the root pom's <version> — `mvn -q -DforceStdout help:evaluate -Dexpression=project.version`
 # UI:    http://localhost:8080/ui/
-# REST:  http://localhost:8080/saiku/api/...
-# Login: admin / admin
+# REST:  http://localhost:8080/rest/saiku/api/...   (Jersey is mounted at /rest/*; bare /saiku/api 403s)
+# Login: admin / admin — the launcher refuses to boot on this default unless SAIKU_ALLOW_DEFAULT_ADMIN=true,
+#        SAIKU_DEMO=true, or a real SAIKU_ADMIN_PASSWORD is set (saiku#1153)
 ```
 
 For the SvelteKit UI (`saiku-ui/`, version-tracked independently as 3.17.0):
