@@ -27,8 +27,9 @@ Plus, since saiku#1990 / saiku#1992, the supply-chain material:
 | npm provenance for both embed packages | npm / Sigstore |
 
 The design-system npm package (`@concepttocloud/saiku-design-system`) is
-released by its **own** workflow (`design-system.yml`) on its own cadence — not
-covered here.
+released by its **own** workflow (`design-system.yml`) on its own cadence. It
+publishes with `npm publish --provenance` like the embed packages (see
+[npm packages](#npm-packages)); nothing else here applies to it.
 
 ## SBOM generation
 
@@ -163,12 +164,14 @@ docker buildx imagetools inspect ghcr.io/spiculedata/saiku:<version> \
 
 ### npm packages
 
-Both embed packages publish with `npm publish --provenance`, so npm hosts a
-verifiable provenance statement:
+Both embed packages, and the design-system package (from `design-system.yml`),
+publish with `npm publish --provenance`, so npm hosts a verifiable provenance
+statement:
 
 ```bash
 npm audit signatures                       # in a project that installed them
 npm view @concepttocloud/saiku-embed dist.attestations
+npm view @concepttocloud/saiku-design-system dist.attestations
 ```
 
 ## SLSA level
