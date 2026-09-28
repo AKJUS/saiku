@@ -198,6 +198,14 @@ mvn verify -P integration
 See [`CLAUDE.md`](CLAUDE.md) for the full layout, the dependency catalog
 (`saiku-bom`), and the GitHub Packages auth gotcha for local builds.
 
+## Verifying release artifacts
+
+The fat JAR, dist zip, container image and npm packages are all signed
+via [Sigstore](https://www.sigstore.dev/) and carry SLSA build
+provenance — see [`docs/VERIFYING-RELEASES.md`](docs/VERIFYING-RELEASES.md)
+for a worked verification example per artifact type
+(`gh attestation verify`, `cosign verify`, `npm audit signatures`).
+
 ## Repository layout
 
 ```
