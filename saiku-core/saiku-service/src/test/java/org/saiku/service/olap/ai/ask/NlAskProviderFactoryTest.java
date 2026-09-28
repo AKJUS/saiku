@@ -229,8 +229,7 @@ public class NlAskProviderFactoryTest {
     public void ollamaHonoursExplicitModelAndEndpoint() {
         String model = "llama3.1:8b-instruct-q4_K_M";
         String endpoint = "http://gpu-box:11434/v1/chat/completions";
-        NlAskProvider p =
-                new NlAskProviderFactory("ollama", null, model, endpoint, env(Map.of())).build();
+        NlAskProvider p = new NlAskProviderFactory("ollama", null, model, endpoint, env(Map.of())).build();
         assertTrue(p instanceof OpenAINlAskProvider);
     }
 

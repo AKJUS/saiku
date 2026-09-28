@@ -39,9 +39,7 @@ public class LlmProviderFactoryTest {
 
     private static void assertIsOpenAiCompat(LlmProvider p) {
         assertNotNull(p);
-        assertTrue(
-                "expected OpenAiCompatProvider, got " + p.getClass().getName(),
-                p instanceof OpenAiCompatProvider);
+        assertTrue("expected OpenAiCompatProvider, got " + p.getClass().getName(), p instanceof OpenAiCompatProvider);
     }
 
     @Test
@@ -123,8 +121,7 @@ public class LlmProviderFactoryTest {
 
     @Test
     public void openaiUsesExplicitKey() {
-        LlmProviderFactory factory =
-                new LlmProviderFactory("openai", null, null, "sk-openai", null, null, emptyEnv());
+        LlmProviderFactory factory = new LlmProviderFactory("openai", null, null, "sk-openai", null, null, emptyEnv());
         assertIsOpenAiCompat(factory.build());
     }
 
@@ -152,8 +149,7 @@ public class LlmProviderFactoryTest {
     public void ollamaHonoursExplicitModelAndEndpoint() {
         String model = "llama3.1:8b-instruct-q4_K_M";
         String endpoint = "http://gpu-box:11434/v1/chat/completions";
-        LlmProviderFactory factory =
-                new LlmProviderFactory("ollama", null, null, null, model, endpoint, emptyEnv());
+        LlmProviderFactory factory = new LlmProviderFactory("ollama", null, null, null, model, endpoint, emptyEnv());
         assertIsOpenAiCompat(factory.build());
     }
 
@@ -161,8 +157,8 @@ public class LlmProviderFactoryTest {
 
     @Test
     public void describeNoopWhenUnconfigured() {
-        LlmProviderFactory.Descriptor d = new LlmProviderFactory(null, null, null, null, null, null, emptyEnv())
-                .describe();
+        LlmProviderFactory.Descriptor d =
+                new LlmProviderFactory(null, null, null, null, null, null, emptyEnv()).describe();
         assertEquals("noop", d.provider());
         assertFalse(d.configured());
     }

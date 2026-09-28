@@ -230,8 +230,7 @@ public final class LlmProviderFactory {
             return new Descriptor(PROVIDER_OPENAI, effectiveModel, effectiveEndpoint, configured);
         }
         if (PROVIDER_OLLAMA.equalsIgnoreCase(name)) {
-            String effectiveModel =
-                    normalise(openAiModel) == null ? DEFAULT_OLLAMA_MODEL : normalise(openAiModel);
+            String effectiveModel = normalise(openAiModel) == null ? DEFAULT_OLLAMA_MODEL : normalise(openAiModel);
             String effectiveEndpoint =
                     normalise(openAiEndpoint) == null ? DEFAULT_OLLAMA_ENDPOINT : normalise(openAiEndpoint);
             return new Descriptor(PROVIDER_OLLAMA, effectiveModel, effectiveEndpoint, true);

@@ -109,8 +109,7 @@ public class OpenAiCompatProviderParseTest {
         usage.put("prompt_tokens", promptTokens);
         usage.put("completion_tokens", completionTokens);
 
-        ObjectNode message =
-                root.putArray("choices").addObject().putObject("message");
+        ObjectNode message = root.putArray("choices").addObject().putObject("message");
         message.put("role", "assistant");
         message.putNull("content");
         ObjectNode call = message.putArray("tool_calls").addObject();

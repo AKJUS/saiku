@@ -247,7 +247,8 @@ public final class OpenAiCompatProvider implements LlmProvider {
                 metadata.put("usage_input_tokens", usage.get("prompt_tokens").asInt());
             }
             if (usage.has("completion_tokens")) {
-                metadata.put("usage_output_tokens", usage.get("completion_tokens").asInt());
+                metadata.put(
+                        "usage_output_tokens", usage.get("completion_tokens").asInt());
             }
         }
 
