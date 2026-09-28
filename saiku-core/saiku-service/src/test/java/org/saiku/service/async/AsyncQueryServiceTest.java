@@ -66,6 +66,40 @@ public class AsyncQueryServiceTest {
         assertEquals("worker must see the submitting thread's principal", "alice", stub.seenPrincipal.get());
     }
 
+    /**
+     * The worker may first touch the session-scoped ThinQueryService proxy after the submitting HTTP
+     * request has completed. Spring's ServletRequestAttributes can only create a session-scoped bean
+     * post-completion if it cached the HttpSession while the request was live — otherwise it throws
+     * "Scope 'session' is not active for the current thread" (the AiQueryAsyncIT failure: the AI
+     * endpoint never touches thinQueryBean on the request thread). submit() must obtain the session
+     * on the calling thread.
+     */
+    @Test
+    public void submit_obtainsSessionOnCallingThread() throws Exception {
+        AtomicReference<Thread> sessionObtainedOn = new AtomicReference<>();
+        org.springframework.web.context.request.RequestAttributes attrs =
+                (org.springframework.web.context.request.RequestAttributes) Proxy.newProxyInstance(
+                        getClass().getClassLoader(),
+                        new Class<?>[] {org.springframework.web.context.request.RequestAttributes.class},
+                        (proxy, method, args) -> {
+                            if ("getSessionId".equals(method.getName())) {
+                                sessionObtainedOn.compareAndSet(null, Thread.currentThread());
+                                return "session-1";
+                            }
+                            return null;
+                        });
+
+        StubThinQueryService stub = new StubThinQueryService();
+        svc = new AsyncQueryService();
+        svc.setThinQueryService(stub);
+
+        AsyncQueryHandle h = svc.submit(named("q-session"), attrs);
+        awaitStatus(h, AsyncQueryHandle.Status.DONE, 2000);
+
+        assertSame(
+                "session must be obtained on the submitting thread", Thread.currentThread(), sessionObtainedOn.get());
+    }
+
     @Test(expected = IllegalStateException.class)
     public void submit_throwsWhenThinQueryServiceUnwired() {
         svc = new AsyncQueryService();
