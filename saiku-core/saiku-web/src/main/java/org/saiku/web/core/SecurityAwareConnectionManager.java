@@ -243,9 +243,11 @@ public class SecurityAwareConnectionManager extends AbstractConnectionManager im
                 }
             }
 
-            if (roleName == null) {
+            if (StringUtils.isBlank(roleName)) {
                 // saiku#1968 (CWE-863): no Spring authority intersected the cube's roles. Deny a
                 // non-admin instead of falling through to setRoleName(null) = Mondrian root.
+                // saiku#1972: a blank name is no role too.
+                roleName = null;
                 enforceRoleResolvedOrAdmin(datasource);
             }
 
@@ -270,15 +272,31 @@ public class SecurityAwareConnectionManager extends AbstractConnectionManager im
                 }
             }
 
-            if (roleName == null) {
+            if (StringUtils.isBlank(roleName)) {
                 // saiku#1968 (CWE-863): no authority mapped to a Mondrian role. Deny a non-admin
                 // instead of falling through to setRoleName(null) = Mondrian root.
+                // saiku#1972: a blank name is no role too.
+                roleName = null;
                 enforceRoleResolvedOrAdmin(datasource);
             }
 
             if (setRole(con, roleName, datasource)) {
                 return con;
             }
+
+        } else if (isDatasourceSecurityEnabled(datasource)
+                && !isDatasourceSecurity(datasource, ISaikuConnection.SECURITY_TYPE_PASSTHROUGH_VALUE)) {
+            // saiku#1972 (CWE-863): security is on but security.type is missing or unrecognised, so
+            // neither branch above sets a role and the connection would stay at Mondrian root. Treat
+            // it as "no role resolved": admin keeps full access, anyone else is denied.
+            log.warn(
+                    "saiku#1972: datasource \"{}\" has {}=true but an unrecognised {} \"{}\"; "
+                            + "no Mondrian role can be applied.",
+                    datasource.getName(),
+                    ISaikuConnection.SECURITY_ENABLED_KEY,
+                    ISaikuConnection.SECURITY_TYPE_KEY,
+                    datasource.getProperties().getProperty(ISaikuConnection.SECURITY_TYPE_KEY));
+            enforceRoleResolvedOrAdmin(datasource);
         }
 
         return con;
@@ -358,6 +376,15 @@ public class SecurityAwareConnectionManager extends AbstractConnectionManager im
         }
     }
 
+    /**
+     * Applies {@code roleName} to the connection.
+     *
+     * <p>saiku#1972 (CWE-863): if Mondrian rejects the role (a mapping typo, trailing whitespace, a
+     * role removed from the schema), the connection's role is not what the configuration asked for
+     * — on a fresh per-principal connection it is still Mondrian root. That used to be logged and
+     * swallowed, handing the caller full access; it now fails closed with an access-denied
+     * exception, for admins too, so the misconfiguration surfaces instead of silently widening.
+     */
     private boolean setRole(ISaikuConnection con, String roleName, SaikuDatasource datasource) {
         if (con.getConnection() instanceof OlapConnection) {
             OlapConnection c = (OlapConnection) con.getConnection();
@@ -374,6 +401,10 @@ public class SecurityAwareConnectionManager extends AbstractConnectionManager im
                 return true;
             } catch (Exception e) {
                 log.error("Error setting role: " + roleName, e);
+                throw new SaikuAccessDeniedException(
+                        "Access denied: role \"" + roleName + "\" could not be applied on datasource \""
+                                + datasource.getName() + "\".",
+                        e);
             }
         }
         return false;
@@ -413,7 +444,8 @@ public class SecurityAwareConnectionManager extends AbstractConnectionManager im
                 String[] maps = mappings.split(";");
                 for (String map : maps) {
                     String[] m = map.split("=");
-                    if (m.length == 2) {
+                    // saiku#1972: a blank value (ROLE_X= ) maps to no role, not to a role named " ".
+                    if (m.length == 2 && StringUtils.isNotBlank(m[1])) {
                         if (!result.containsKey(m[0])) {
                             result.put(m[0], new ArrayList<String>());
                         }
