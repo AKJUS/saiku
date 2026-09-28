@@ -51,6 +51,8 @@ jobs:
               # sits as BLOCKED waiting for required checks that never fire.
               - '.github/workflows/**'
               - '.github/test-floors.json'
+              - '.coverage-thresholds.json'
+              - 'scripts/check-coverage.sh'
             ui:
               - 'saiku-ui/**'
               - '.github/workflows/**'
@@ -131,6 +133,12 @@ jobs:
             fi
           done < <(jq -r '.modules | to_entries[] | "\(.key)\t\(.value)"' "$FLOORS")
           exit "$fail"
+
+      - name: Verify coverage floors (saiku#2011)
+        # Fails if any module's JaCoCo line coverage drops below its floor in
+        # .coverage-thresholds.json. Reads the jacoco.csv reports mvn verify
+        # just wrote. Raise a floor explicitly when coverage goes up.
+        run: ./scripts/check-coverage.sh
 
   ui:
     name: ui (svelte-check + vitest + build + e2e)

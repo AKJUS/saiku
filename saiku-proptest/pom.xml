@@ -98,7 +98,7 @@
         <version>3.5.2</version>
         <configuration>
           <!-- Hegel calls native code via FFM; silence the JVM native-access warning. -->
-          <argLine>--enable-native-access=ALL-UNNAMED</argLine>
+          <argLine>@{argLine} --enable-native-access=ALL-UNNAMED</argLine>
         </configuration>
       </plugin>
       <!-- Test-only module: never deploy it to a repository. -->
