@@ -1,0 +1,68 @@
+name: Bug report
+description: Something in Saiku is broken or behaving unexpectedly.
+labels: ["Type: Bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this. Exact reproduction steps get bugs fixed much faster.
+
+        **Security issue?** Don't file it here — follow [SECURITY.md](https://github.com/spiculedata/saiku/blob/development/SECURITY.md) instead.
+  - type: input
+    id: version
+    attributes:
+      label: Saiku version
+      description: Shown under Admin → About, or in the launcher JAR name (`saiku-<version>.jar`).
+      placeholder: "4.8.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: distribution
+    attributes:
+      label: How are you running Saiku?
+      options:
+        - Launcher JAR (java -jar saiku-<version>.jar serve)
+        - Docker image (ghcr.io/spiculedata/saiku)
+        - WAR in my own servlet container
+        - Built from source
+        - Other (describe below)
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Output of `java -version`, OS, browser and version (if a UI issue), and the database behind the affected datasource.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: A sequence of steps anyone can repeat. Include the cube/schema and query if relevant (FoodMart is ideal).
+      placeholder: |
+        1. Open ...
+        2. Drag ...
+        3. Click ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: What happened instead. Screenshots help a lot.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Server log excerpt (`saiku-home/logs/`) and/or browser console errors. Redact credentials.
+      render: text

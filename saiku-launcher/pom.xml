@@ -221,7 +221,7 @@
                     <!-- Real OLAP queries are heavyweight; ITs run serially. -->
                     <forkCount>1</forkCount>
                     <reuseForks>true</reuseForks>
-                    <argLine>--add-opens=java.base/java.nio=ALL-UNNAMED</argLine>
+                    <argLine>@{argLine} --add-opens=java.base/java.nio=ALL-UNNAMED</argLine>
                     <!-- Skip driven by the ${skipITs} property (default true in
                          <properties>). CI's `-DskipITs=false` and the
                          {@code integration} profile both flip it on. A literal
@@ -253,7 +253,7 @@
                                     </excludes>
                                 </filter>
                                 <!-- xerces/xalan are transitively pulled by
-                                     mondrian + hadoop (via hive-jdbc) and
+                                     mondrian (formerly also hadoop via hive-jdbc) and
                                      hijack JAXP via META-INF/services
                                      overrides. With Spring 6.2's stricter
                                      XML namespace validation, the
