@@ -1210,10 +1210,15 @@ public class EmbedViewResource {
      *
      * <p>Deliberately NOT set: {@code X-Frame-Options: DENY} and CSP
      * {@code frame-ancestors 'none'} — the embed surface is designed to
-     * render inside the host page (cross-origin XHR / fetch, not iframe),
-     * and we DON'T want to block all framing because a host page that uses
-     * an iframe-fallback for legacy browsers should still work. Each
-     * deployment can tighten CSP at the reverse-proxy layer.
+     * render inside the host page (cross-origin XHR / fetch, not iframe).
+     * The {@link org.saiku.web.servlet.SecurityHeadersFilter} on {@code /*}
+     * therefore supplies the saiku#1917 default of {@code frame-ancestors
+     * 'self'} / {@code X-Frame-Options: SAMEORIGIN} here. That is harmless for
+     * the normal XHR embed (a framed {@code application/json} body can't be
+     * executed thanks to {@code nosniff}), but a deployment that still uses
+     * the iframe fallback for legacy browsers must widen it with
+     * {@code -Dsaiku.security.frameAncestors="'self' https://wiki.example.com"}.
+     * Each deployment can tighten CSP further at the reverse-proxy layer.
      */
     private static Response harden(Response r) {
         return Response.fromResponse(r)
