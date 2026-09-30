@@ -5,6 +5,22 @@ All notable changes to Saiku are documented here. This project follows
 
 ## Unreleased
 
+### Added
+
+- **`ai.provider=ollama` — local/self-hosted model support for the AI ask layer
+  and schema-generation enrichment.** Both now accept `ollama` as a first-class
+  provider value alongside `anthropic`/`openai`: it talks to a local Ollama
+  instance's OpenAI-compatible endpoint (`http://localhost:11434/v1/chat/completions`
+  by default) and needs **no API key**, unlike `openai`/`azure-openai` — Ollama
+  doesn't check one. For PII-strict deployments this means the model never
+  leaves the operator's own trust boundary; the only operator-visible
+  difference from a hosted provider is the URL. Schema-generation enrichment
+  (`saiku.schemagen.llm.provider`) also gained plain `openai` support as part
+  of this, previously Anthropic-only. New `GET /saiku/info/diagnostics`
+  reports each stack's configured provider/model/endpoint plus a live
+  reachability probe — never the API key — so an operator can confirm the
+  wiring without running a query. (saiku#904)
+
 ### Security
 
 - **The SPA ships a default CSP and `frame-ancestors` (CWE-693 / CWE-1021,
