@@ -7,6 +7,37 @@ All notable changes to Saiku are documented here. This project follows
 
 ### Security
 
+- **The SPA ships a default CSP and `frame-ancestors` (CWE-693 / CWE-1021,
+  saiku#1917).** `SecurityHeadersFilter` emitted *no* framing headers unless
+  `-Dsaiku.security.frameAncestors` was set, and a full CSP only under
+  `-Dsaiku.security.csp` — so out of the box `/ui/**` (a `security="none"`
+  Spring chain, which is why Spring's own `X-Frame-Options: DENY` never reached
+  the SPA HTML) was frameable by any origin and script execution was
+  unconstrained. Defaults are now:
+  - `Content-Security-Policy: frame-ancestors 'self'` + `X-Frame-Options: SAMEORIGIN`
+    on every response, closing the clickjacking path to delete / share-link
+    creation / admin toggles.
+  - `Content-Security-Policy-Report-Only` carrying the documented policy
+    (`default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
+    img-src 'self' data: blob: https:; font-src 'self' data:; worker-src 'self'
+    blob:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors
+    'self'`). Report-only, so nothing breaks while a deployment validates it in
+    a browser; `script-src 'self'` is the directive that neutralises the
+    inline-handler payloads from the XSS findings once enforced.
+  - An operator-supplied `saiku.security.csp` that omits `frame-ancestors` now
+    gets the directive appended, so a hand-written policy can't silently
+    re-open the clickjacking hole.
+
+  **Upgrade action — iframe embedders.** If you frame `/ui/?embed=1` from a
+  foreign origin, widen the allow-list:
+  `-Dsaiku.security.frameAncestors="'self' https://wiki.example.com"`.
+  `X-Frame-Options` is then omitted (it cannot express a list) and the CSP
+  `frame-ancestors` directive carries the list. `-Dsaiku.security.frameAncestors=off`
+  restores the old, fully framable behaviour. The web-component embed
+  (`docs/embed/quickstart.md`) is unaffected. To enforce the CSP instead of
+  reporting it, set `-Dsaiku.security.csp` to the policy above; to silence the
+  report-only header, set `-Dsaiku.security.cspReportOnly=off`.
+
 - **Hive/Hadoop are no longer bundled; the Hive JDBC driver is an opt-in
   `plugins/` drop-in** (CWE-1104 / CWE-1395, saiku#1916). `hive-cli`,
   `hive-jdbc` and `hadoop-common` pulled ~150 Hadoop/Hive/YARN/ZooKeeper server
